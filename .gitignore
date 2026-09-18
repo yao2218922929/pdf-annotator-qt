@@ -1,0 +1,17 @@
+# 临时/测试文件
+_del*.pdf
+_toc_tmp.pdf
+__pycache__/
+*.pyc
+
+# 测试脚本
+_t_*.py
+
+# 数据文件（含用户笔记，不应公开）
+*.json
+
+# 图片/文档（体积大，不属于源码）
+*.png
+*.jpg
+*.docx
+*.html
