@@ -12,12 +12,12 @@ import sys
 import time
 
 import pymupdf
-from PySide6.QtCore import (QEvent, QMimeData, QPoint, QPointF, QRect, QRectF,
+from PySide6.QtCore import (QEvent, QMimeData, QPointF, QRectF, QSize,
                             Qt, QTimer, QThread, Signal, QUrl)
-from PySide6.QtGui import (QAction, QBrush, QColor, QDrag, QFont, QImage,
+from PySide6.QtGui import (QAction, QBrush, QColor, QDrag, QFont, QIcon, QImage,
                            QImageReader, QKeySequence, QMouseEvent,
                            QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
-                           QShortcut, QTextCursor, QTextDocument,
+                           QShortcut, QTextCharFormat, QTextCursor, QTextDocument,
                            QTextImageFormat, QTextListFormat)
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog,
                                QComboBox,
@@ -31,11 +31,11 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDial
                                QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea,
                                QSpinBox, QSplitter, QStackedWidget, QStyle,
                                QPlainTextEdit, QStyledItemDelegate, QStyleFactory,
-                               QTabBar, QTextBrowser, QTextEdit, QToolBar,
+                               QTabBar, QTextBrowser, QToolBar,
                                QToolButton,
                                QTreeWidget, QTreeWidgetItem,
-                               QTreeWidgetItemIterator, QVBoxLayout,
-                               QWidget, QHeaderView)
+                               QVBoxLayout,
+                               QWidget)
 from PySide6.QtWidgets import QDockWidget
 
 # Markdown 阅读用 WebEngine；缺失时降级为纯文本显示（不阻塞程序启动）
@@ -80,13 +80,12 @@ def colors_save(lst):
 
 WIDTHS = [("细 1pt", 1.0), ("中 2pt", 2.0), ("粗 3.5pt", 3.5),
           ("特粗 5pt", 5.0), ("加粗 8pt", 8.0), ("最粗 12pt", 12.0)]
-ZOOMS = [0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 0.65, 0.80, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0]
 RENDER_SCALE = 3.0  # 内部渲染倍数：直接以 用户倍率×RENDER_SCALE×屏幕dpr 高分辨率渲染，不降采样
 TOOLS = [("查看/拖动", "view"), ("选择文字", "selecttext"), ("选择批注", "selanno"),
-         ("荧光笔", "highlight"), ("文字", "text"), ("文字高亮", "texthl")]
-# 图形类工具合并为工具栏上一个"图形"按钮：左键用当前图形，右键弹菜单切换
-SHAPE_ITEMS = [("画笔", "pen"), ("矩形", "rect"), ("椭圆", "oval"),
-               ("直线", "line"), ("箭头", "arrow")]
+         ("文字", "text"), ("文字高亮", "texthl")]
+# 画笔类工具合并为工具栏上一个"画笔"按钮：左键用当前画笔，右键弹菜单切换
+SHAPE_ITEMS = [("画笔", "pen"), ("荧光笔", "highlight"), ("矩形", "rect"),
+               ("椭圆", "oval"), ("直线", "line"), ("箭头", "arrow")]
 SHAPE_VALS = {v for _, v in SHAPE_ITEMS}
 SHAPE_NAMES = {v: n for n, v in SHAPE_ITEMS}
 TEXT_FS = 10
@@ -636,11 +635,6 @@ class ShortcutDialog(QDialog):
         return cfg
 
 
-def hex_rgb(h):
-    c = QColor(h)
-    return (c.red(), c.green(), c.blue())
-
-
 class MdPanel(QWidget):
     """Markdown 阅读面板（放在中间画布区，与 PDF 画布用堆栈切换）。
     用 QWebEngineView 渲染 HTML；缺失 WebEngine 时降级为纯文本只读显示。
@@ -856,6 +850,34 @@ class NoteEditor(QTextBrowser):
         self._press_pt = None        # 按下时的视图坐标
         self._dragging = False       # 正在拖动图片
         self._move_src = None        # 拖动中图片的原字符位置
+        # 选中文字后浮出的格式条（窗口子控件，跟随选区）
+        self.fmt_bar = FloatingFormatBar(self)
+        self.selectionChanged.connect(self._on_selection_changed)
+        # 滚动时选区位置会偏移，直接收起格式条（滚完重新选即可）
+        self.verticalScrollBar().valueChanged.connect(self.fmt_bar.hide_bar)
+
+    def _on_selection_changed(self):
+        self._refresh_fmt_bar()
+
+    def _refresh_fmt_bar(self):
+        """无选区（或选区只是图片）→ 隐藏格式条；否则浮到选区上方。"""
+        cur = self.textCursor()
+        fmt = cur.charFormat()
+        if (cur.hasSelection() and cur.selectedText().strip()
+                and not fmt.isImageFormat()):
+            self.fmt_bar.refresh()
+        else:
+            self.fmt_bar.hide_bar()
+
+    def focusOutEvent(self, e):
+        # 焦点离开编辑器时收起格式条；但点格式条自身（如字号下拉）不算
+        w = QApplication.focusWidget()
+        if w is not None and (w is self.fmt_bar
+                              or self.fmt_bar.isAncestorOf(w)):
+            super().focusOutEvent(e)
+            return
+        self.fmt_bar.hide_bar()
+        super().focusOutEvent(e)
 
     # ---- 粘贴 ----
     def _mime_image(self, source):
@@ -1111,6 +1133,180 @@ class NoteEditor(QTextBrowser):
         m.addSeparator()
         m.addAction("删除图片", lambda: self._delete_image(pos))
         m.exec(e.globalPos())
+
+
+class FloatingFormatBar(QFrame):
+    """在笔记编辑器里选中文字后浮出的小格式条，可就地编辑选中文字。
+    作为窗口的子控件存在，内部按钮全部 NoFocus，点击时不会打断编辑器选区。"""
+
+    def __init__(self, editor):
+        super().__init__(editor.viewport())
+        self.editor = editor
+        self.setObjectName("floatFmtBar")
+        self.setFrameShape(QFrame.NoFrame)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setStyleSheet("""
+            #floatFmtBar { background:#ffffff; border:1px solid #c9c9c9;
+                           border-radius:8px; }
+            #floatFmtBar QToolButton {
+                border:none; background:transparent; border-radius:5px;
+                padding:3px 6px; color:#333; font-size:13px; }
+            #floatFmtBar QToolButton:hover { background:#ececec; }
+            #floatFmtBar QToolButton:pressed { background:#dcdcdc; }
+            #floatFmtBar QComboBox {
+                border:1px solid #cfcfcf; border-radius:5px;
+                padding:1px 4px; min-width:46px; font-size:12px; }
+        """)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(2)
+
+        def mk(text, tip, cb):
+            b = QToolButton()
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setFocusPolicy(Qt.NoFocus)      # 关键：不抢编辑器焦点
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(cb)
+            lay.addWidget(b)
+            return b
+
+        self.btn_size = QComboBox()
+        self.btn_size.setFocusPolicy(Qt.NoFocus)
+        for s in (10, 12, 14, 16, 18, 20, 24, 28, 32):
+            self.btn_size.addItem(f"{s}", s)
+        self.btn_size.setToolTip("字号")
+        self.btn_size.activated.connect(self._on_size)
+        lay.addWidget(self.btn_size)
+
+        self._sep(lay)
+        self.btn_bold = mk("B", "加粗", lambda: self._toggle("bold"))
+        self.btn_bold.setStyleSheet("font-weight:bold;")
+        self.btn_italic = mk("I", "斜体", lambda: self._toggle("italic"))
+        self.btn_italic.setStyleSheet("font-style:italic;")
+        self.btn_under = mk("U", "下划线", lambda: self._toggle("underline"))
+        self.btn_under.setStyleSheet("text-decoration:underline;")
+        self.btn_strike = mk("S", "删除线", lambda: self._toggle("strike"))
+        self.btn_strike.setStyleSheet("text-decoration:line-through;")
+        self._sep(lay)
+        self.btn_color = mk("A", "文字颜色", self._pick_color)
+        self.btn_color.setStyleSheet("color:#d84315; font-weight:bold;")
+        self.btn_bg = mk("▨", "高亮背景", self._pick_bg)
+        self._sep(lay)
+        mk("✕", "清除格式", self._clear_format)
+
+        self.adjustSize()
+        self.hide()
+
+    @staticmethod
+    def _sep(lay):
+        ln = QFrame()
+        ln.setFrameShape(QFrame.VLine)
+        ln.setStyleSheet("color:#d5d5d5;")
+        ln.setFixedHeight(16)
+        lay.addWidget(ln)
+
+    # ---- 显示/定位 ----
+    def refresh(self):
+        """有选区就浮到选区上方，没有就隐藏。"""
+        cur = self.editor.textCursor()
+        if not cur.hasSelection():
+            self.hide()
+            return
+        vp = self.editor.viewport()
+        c1 = QTextCursor(cur)
+        c1.setPosition(cur.selectionStart())
+        c2 = QTextCursor(cur)
+        c2.setPosition(cur.selectionEnd())
+        r1 = self.editor.cursorRect(c1)
+        r2 = self.editor.cursorRect(c2)
+        top = min(r1.top(), r2.top())
+        cx = (r1.center().x() + r2.center().x()) // 2
+        vp = self.editor.viewport()
+        x = cx - self.width() // 2
+        y = top - self.height() - 6
+        # 贴到视口顶部时改放到选区下方，避免被工具栏挡住
+        if y < 2:
+            y = max(r1.bottom(), r2.bottom()) + 6
+        x = max(2, min(x, vp.width() - self.width() - 2))
+        y = max(2, min(y, vp.height() - self.height() - 2))
+        self.move(x, y)
+        self._sync_size()
+        self.raise_()
+        self.show()
+
+    def hide_bar(self, *args):
+        self.hide()
+
+    # ---- 应用格式 ----
+    def _sync_size(self):
+        """把字号下拉同步为选区当前字号。"""
+        cur = self.editor.textCursor()
+        size = cur.charFormat().fontPointSize()
+        if size <= 0:
+            size = self.editor.fontPointSize() or self.editor.font().pointSize()
+        idx = self.btn_size.findData(int(size)) if size > 0 else -1
+        if idx >= 0:
+            self.btn_size.blockSignals(True)
+            self.btn_size.setCurrentIndex(idx)
+            self.btn_size.blockSignals(False)
+
+    def _apply(self, fn):
+        cur = self.editor.textCursor()
+        if not cur.hasSelection():
+            return
+        fn(cur)
+        self.editor.setTextCursor(cur)
+        self.editor.setFocus()
+        if self.editor.note_panel is not None:
+            self.editor.note_panel._on_text_changed()
+        self.refresh()
+
+    def _toggle(self, prop):
+        cur = self.editor.textCursor()
+        if not cur.hasSelection():
+            return
+        src = cur.charFormat()
+        f = QTextCharFormat()
+        if prop == "bold":
+            f.setFontWeight(QFont.Normal if src.fontWeight() >= QFont.Bold
+                            else QFont.Bold)
+        elif prop == "italic":
+            f.setFontItalic(not src.fontItalic())
+        elif prop == "underline":
+            f.setFontUnderline(not src.fontUnderline())
+        elif prop == "strike":
+            f.setFontStrikeOut(not src.fontStrikeOut())
+        self._apply(lambda c: c.mergeCharFormat(f))
+
+    def _on_size(self):
+        size = self.btn_size.currentData()
+        if not size:
+            return
+        f = QTextCharFormat()
+        f.setFontPointSize(float(size))
+        self._apply(lambda c: c.mergeCharFormat(f))
+
+    def _pick_color(self):
+        cur = self.editor.textCursor()
+        base = cur.charFormat().foreground().color() or QColor("#212121")
+        c = QColorDialog.getColor(base, self.editor.window(), "文字颜色")
+        if c.isValid():
+            f = QTextCharFormat()
+            f.setForeground(QBrush(c))
+            self._apply(lambda cc: cc.mergeCharFormat(f))
+
+    def _pick_bg(self):
+        cur = self.editor.textCursor()
+        base = cur.charFormat().background().color() or QColor("#fff59d")
+        c = QColorDialog.getColor(base, self.editor.window(), "高亮背景")
+        if c.isValid():
+            f = QTextCharFormat()
+            f.setBackground(QBrush(c))
+            self._apply(lambda cc: cc.mergeCharFormat(f))
+
+    def _clear_format(self):
+        self._apply(lambda c: c.setCharFormat(QTextCharFormat()))
 
 
 class NotePanel(QWidget):
@@ -1569,6 +1765,7 @@ class NotePanel(QWidget):
         self._loading = True
         self.editor.setHtml(info.get("html", ""))
         self._loading = False
+        self.editor.fmt_bar.hide_bar()
         self._save_pending = False
 
     # ---- 格式化 ----
@@ -1726,9 +1923,6 @@ class NotePanel(QWidget):
         data[self._current_id]["html"] = html
         self._save_notes(data)
         self._save_pending = False
-
-    def has_unsaved(self):
-        return self._save_pending
 
 
 def hex_rgb(h):
@@ -2416,6 +2610,29 @@ def md_read_text(path):
     return raw.decode("utf-8", errors="replace")
 
 
+def make_tab_close_icon(color="#8a8a8a", hover="#e53935", size=16):
+    """自绘标签关闭图标：两个状态下都返回细线 ✕，悬停时变红。"""
+    def _draw(col):
+        pm = QPixmap(size, size)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        pen = QPen(QColor(col))
+        pen.setWidthF(1.6)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        m = 3.5
+        p.drawLine(QPointF(m, m), QPointF(size - m, size - m))
+        p.drawLine(QPointF(size - m, m), QPointF(m, size - m))
+        p.end()
+        return pm
+    ic = QIcon()
+    ic.addPixmap(_draw(color), QIcon.Normal)
+    ic.addPixmap(_draw(hover), QIcon.Active)
+    ic.addPixmap(_draw(hover), QIcon.Selected)
+    return ic
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2434,7 +2651,7 @@ class MainWindow(QMainWindow):
         self.page_map = []        # 当前页索引 -> 原始页索引（删页后用于保存定位）
         self._saved_sig = None    # 上次保存时的编辑状态签名（退出时比对是否需提示）
         self.tool = "selecttext"   # 默认"选择文字"：拖选即复制（普通阅读器习惯）
-        self._shape_cur = "pen"    # "图形"按钮当前图形，默认画笔
+        self._shape_cur = "pen"    # "画笔"按钮当前画笔，默认画笔
         self.color_hex = COLORS[0][1]
         self.wpt = WIDTHS[1][1]
 
@@ -2520,14 +2737,14 @@ class MainWindow(QMainWindow):
         self.doc_tabs = QTabBar()
         self.doc_tabs.setExpanding(False)
         self.doc_tabs.setDrawBase(True)
-        self.doc_tabs.setTabsClosable(True)
+        self.doc_tabs.setTabsClosable(False)   # 用自绘的关闭按钮替代原生 ✕
         self.doc_tabs.setMovable(False)
         self.doc_tabs.setUsesScrollButtons(True)
         self.doc_tabs.setElideMode(Qt.ElideRight)
         self.doc_tabs.setStyleSheet("""
             QTabBar { background:#e8e8e8; }
             QTabBar::tab {
-                background:#dcdcdc; color:#333; padding:6px 12px;
+                background:#dcdcdc; color:#333; padding:5px 8px 5px 11px;
                 border:1px solid #bdbdbd; border-bottom:none;
                 border-top-left-radius:6px; border-top-right-radius:6px;
                 margin-right:2px; max-width:340px;
@@ -2535,11 +2752,8 @@ class MainWindow(QMainWindow):
             QTabBar::tab:selected { background:#ffffff; color:#d84315;
                                     font-weight:bold; }
             QTabBar::tab:hover { background:#f0f0f0; }
-            QTabBar::close-button { subcontrol-position:right; padding:2px; }
-            QTabBar::close-button:hover { background:#e53935; border-radius:3px; }
         """)
         self.doc_tabs.currentChanged.connect(self.on_doc_tab_changed)
-        self.doc_tabs.tabCloseRequested.connect(self.on_doc_tab_close)
         self.doc_tabs.hide()   # 无文档时隐藏
 
         content_box = QWidget()
@@ -2758,16 +2972,6 @@ class MainWindow(QMainWindow):
         self.settings_btn.setMenu(self._settings_menu)
         tb.addWidget(self.settings_btn)
 
-        # 弹性空白：把"关闭"按钮顶到工具栏最右侧
-        spacer = QWidget()
-        sp = QHBoxLayout(spacer)
-        sp.setContentsMargins(0, 0, 0, 0)
-        sp.addStretch(1)
-        tb.addWidget(spacer)
-        self.close_doc_action = add_text(
-            "✕ 关闭", "关闭当前文档（Markdown 或 PDF）",
-            self.close_current_document, pdf_only=False)
-        self.close_doc_action.setEnabled(False)   # 初始无文档
 
         # 第二行：工具（强制换行，固定常显示，不折回第一行）
         tb2 = QToolBar("工具")
@@ -2803,11 +3007,11 @@ class MainWindow(QMainWindow):
             self.pdf_only_actions.append(a)
         tb2.addSeparator()
 
-        # ---- "图形"合并按钮：左键用当前图形，右键弹出菜单切换 ----
+        # ---- "画笔"合并按钮：左键用当前画笔，右键弹出菜单切换 ----
         self.shape_btn = QToolButton()
-        self.shape_btn.setText("图形")
+        self.shape_btn.setText("画笔")
         self.shape_btn.setCheckable(True)
-        self.shape_btn.setToolTip("图形：画笔（左键使用，右键切换：画笔/矩形/椭圆/直线/箭头）")
+        self.shape_btn.setToolTip("画笔（左键使用，右键切换：画笔/荧光笔/矩形/椭圆/直线/箭头）")
         self.shape_btn.setPopupMode(QToolButton.MenuButtonPopup)
         self.shape_btn.setContextMenuPolicy(Qt.CustomContextMenu)
         self.shape_btn.customContextMenuRequested.connect(
@@ -2826,7 +3030,7 @@ class MainWindow(QMainWindow):
             self._shape_actions[val] = a
         self.shape_btn.setMenu(self.shape_menu)
         self.shape_btn.clicked.connect(
-            lambda: self.pick_tool(self._shape_tool()))  # 左键：切到当前图形
+            lambda: self.pick_tool(self._shape_tool()))  # 左键：切到当前画笔
         tb2.addWidget(self.shape_btn)
         self.pdf_only_widgets.append(self.shape_btn)
         tb2.addSeparator()
@@ -2974,7 +3178,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"“{name}”颜色已改为 {new_hex}")
 
     def _shape_tool(self):
-        """当前"图形"按钮对应的图形工具值。"""
+        """当前"画笔"按钮对应的画笔工具值。"""
         return self._shape_cur if self._shape_cur in SHAPE_VALS else "pen"
 
     # 循环切换的三个常用工具（Tab）
@@ -3001,12 +3205,12 @@ class MainWindow(QMainWindow):
             self.commit_text_editor()  # 切走工具时提交内联文字
         self.tool = val
         if val in SHAPE_VALS:
-            # 记住当前图形，供"图形"按钮左键使用；同步按钮文字与菜单勾选
+            # 记住当前画笔，供"画笔"按钮左键使用；同步按钮提示与菜单勾选
             self._shape_cur = val
             if hasattr(self, "shape_btn"):
-                nm = SHAPE_NAMES.get(val, "图形")
+                nm = SHAPE_NAMES.get(val, "画笔")
                 self.shape_btn.setToolTip(
-                    f"图形：{nm}（左键使用，右键切换：画笔/矩形/椭圆/直线/箭头）")
+                    f"画笔：{nm}（左键使用，右键切换：画笔/荧光笔/矩形/椭圆/直线/箭头）")
             if hasattr(self, "_shape_actions") and val in self._shape_actions:
                 self._shape_actions[val].setChecked(True)
             for v, a in getattr(self, "_tool_actions", {}).items():
@@ -3102,13 +3306,6 @@ class MainWindow(QMainWindow):
         self._zoom_factor = max(0.05, z)
         self.load_page()
 
-    def set_zoom(self, factor):
-        """直接设置缩放比例。"""
-        if not self.doc:
-            return
-        self._zoom_factor = max(0.1, min(10.0, factor))
-        self.load_page()
-
     def open_pdf(self):
         f, _ = QFileDialog.getOpenFileName(self, "选择PDF文件", "", "PDF 文件 (*.pdf)")
         if not f:
@@ -3158,13 +3355,6 @@ class MainWindow(QMainWindow):
             if self.doc_tabs.tabData(i) == path:
                 return i
         return -1
-
-    def _refresh_tab_text(self, path):
-        i = self._tab_index_of(path)
-        if i < 0:
-            return
-        self.doc_tabs.setTabText(i, os.path.basename(path))
-        self.doc_tabs.setTabToolTip(i, path)
 
     def _switch_to_session(self, path):
         """切换到已打开的某个 PDF 会话（点击标签/重复打开同一文件）。"""
@@ -3227,6 +3417,7 @@ class MainWindow(QMainWindow):
         idx = self.doc_tabs.addTab(os.path.basename(f))
         self.doc_tabs.setTabData(idx, f)
         self.doc_tabs.setTabToolTip(idx, f)
+        self._install_tab_close_btn(idx, f)
         self.doc_tabs.setCurrentIndex(idx)
         self.doc_tabs.blockSignals(blocked)
         self.doc_tabs.show()
@@ -3253,6 +3444,24 @@ class MainWindow(QMainWindow):
         path = self.doc_tabs.tabData(idx)
         if path and path != self.pdf_path:
             self._switch_to_session(path)
+
+    def _install_tab_close_btn(self, idx, path):
+        """给标签右侧装一个自绘的关闭按钮（比原生 ✕ 更精致）。"""
+        btn = QToolButton(self.doc_tabs)
+        btn.setIcon(make_tab_close_icon())
+        btn.setIconSize(QSize(14, 14))
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setAutoRaise(True)
+        btn.setFixedSize(18, 18)
+        btn.setToolTip("关闭此文档")
+        btn.setStyleSheet(
+            "QToolButton { border:none; background:transparent;"
+            " border-radius:9px; }"
+            "QToolButton:hover { background:#e0e0e0; }"
+            "QToolButton:pressed { background:#c8c8c8; }")
+        # 按路径关闭：标签删除后索引会变，用路径定位更稳妥
+        btn.clicked.connect(lambda _=False, p=path: self._close_pdf_path(p))
+        self.doc_tabs.setTabButton(idx, QTabBar.RightSide, btn)
 
     def on_doc_tab_close(self, idx):
         """点击某标签的 ✕：关闭对应 PDF（未保存先提示）。"""
@@ -3301,18 +3510,6 @@ class MainWindow(QMainWindow):
             self.setWindowTitle(f"{base} - PDF 批注工具")
         else:
             self.setWindowTitle("PDF 批注工具 (Qt版)")
-        # 统一关闭按钮：有 PDF 或 MD 任一打开时可用
-        if hasattr(self, "close_doc_action"):
-            self.close_doc_action.setEnabled(bool(self.doc) or bool(self.md_path))
-            if is_md and self.md_path and self.doc:
-                tip = "关闭当前 Markdown（后台 PDF 保留）"
-            elif is_md and self.md_path:
-                tip = "关闭当前 Markdown"
-            elif self.doc:
-                tip = "关闭当前 PDF"
-            else:
-                tip = "关闭当前文档"
-            self.close_doc_action.setToolTip(tip)
 
     def _on_note_dock_vis(self, vis):
         # 迁移到全屏时 dock 会被隐藏，这不算用户关闭
@@ -3848,15 +4045,6 @@ class MainWindow(QMainWindow):
             return None
         return src
 
-    def _toc_lvl_of(self, item):
-        """条目当前在树中的层级（1基）。"""
-        lvl = 1
-        par = item.parent()
-        while par is not None and par.data(0, Qt.UserRole + 1) is not None:
-            lvl += 1
-            par = par.parent()
-        return lvl
-
     def _toc_mark_dirty(self):
         self.toc_dirty = True
         self.refresh_toc()
@@ -4285,20 +4473,6 @@ class MainWindow(QMainWindow):
                 if self.md_path:
                     self._apply_view_mode("md")
         self.statusBar().showMessage(f"已关闭: {os.path.basename(path)}", 3000)
-
-    def close_pdf(self):
-        """关闭当前 PDF（工具栏/菜单入口，兼容旧调用）。"""
-        if self.doc:
-            self._close_pdf_path(self.pdf_path)
-
-    def close_current_document(self):
-        """工具栏统一关闭按钮：MD 模式关 Markdown，否则关当前 PDF 标签。"""
-        if self._view_mode == "md" and self.md_path:
-            self.close_md()
-        elif self.doc:
-            self._close_pdf_path(self.pdf_path)
-        else:
-            self.statusBar().showMessage("当前没有可关闭的文档")
 
     def on_escape(self):
         """Esc：先退出内联文字编辑；搜索框打开时关闭搜索并清除高亮，否则取消文字选区。"""
@@ -4950,10 +5124,6 @@ class MainWindow(QMainWindow):
                     continue
             out.append(w)
         return out
-
-    def words_in(self, sel_rect):
-        """当前页内命中词（保持与旧接口兼容）。"""
-        return self._hit_words(self.page_no, sel_rect)
 
     def words_in_scene(self, scene_rect):
         """跨页命中：选区(场景坐标)可能同时覆盖上/下邻页预览，逐页换算成该页
