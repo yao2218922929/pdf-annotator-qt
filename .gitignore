@@ -22,5 +22,14 @@ _runall.txt
 # 打包产物
 build/
 build_spec/
+build_onedir/
 dist/
+dist_onefile/
+dist_onedir/
+*.zip
 *.spec
+
+# 本地临时脚本
+_align.py
+_z_*.py
+_z_*.txt
