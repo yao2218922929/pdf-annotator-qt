@@ -6,6 +6,9 @@ __pycache__/
 
 # 测试脚本
 _t_*.py
+_t_*.txt
+_runall.py
+_runall.txt
 
 # 数据文件（含用户笔记，不应公开）
 *.json

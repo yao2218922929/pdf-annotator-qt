@@ -10,14 +10,17 @@ import os
 import shutil
 import sys
 import time
+import copy
+from collections import OrderedDict
 
 import pymupdf
-from PySide6.QtCore import (QEvent, QMimeData, QPointF, QRectF, QSize,
-                            Qt, QTimer, QThread, Signal, QUrl)
+from PySide6.QtCore import (QEvent, QMimeData, QPoint, QPointF, QRect, QRectF,
+                            QSize, Qt, QTimer, QThread, Signal, QUrl)
 from PySide6.QtGui import (QAction, QBrush, QColor, QDrag, QFont, QIcon, QImage,
                            QImageReader, QKeySequence, QMouseEvent,
                            QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
-                           QShortcut, QTextCharFormat, QTextCursor, QTextDocument,
+                           QShortcut, QTextBlockFormat, QTextCharFormat,
+                           QTextCursor, QTextDocument,
                            QTextImageFormat, QTextListFormat)
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog,
                                QComboBox,
@@ -53,6 +56,46 @@ COLORS = [("红", "#e53935"), ("蓝", "#1e88e5"), ("绿", "#43a047"),
 # 颜色按钮配置（可右键自定义）；存于用户目录，下次启动沿用
 COLORS_FILE = os.path.join(os.path.expanduser("~"), ".pdf_anno_colors.json")
 
+# 写盘失败的文件清单（供统一提示，避免配置/数据静默丢失）
+_SAVE_ERRORS = []
+
+
+def _safe_write_json(path, obj):
+    """原子写入 JSON（先写临时文件再替换）。成功 True，失败 False 并记录。"""
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        _SAVE_ERRORS.append((path, str(e)))
+        return False
+
+
+def flush_save_errors(parent=None, title="保存失败"):
+    """若有写盘失败记录，弹一次提示并清空。返回是否有失败。"""
+    global _SAVE_ERRORS
+    if not _SAVE_ERRORS:
+        return False
+    seen, lines = set(), []
+    for path, err in _SAVE_ERRORS:
+        if path in seen:
+            continue
+        seen.add(path)
+        lines.append(f"· {os.path.basename(path)}：{err}")
+    _SAVE_ERRORS = []
+    QMessageBox.warning(
+        parent, title,
+        "以下内容未能保存到磁盘，请检查磁盘空间或文件是否被占用：\n\n"
+        + "\n".join(lines))
+    return True
+
 
 def colors_load():
     """读取自定义颜色板。返回 [[名称, #rrggbb], ...]；无/损坏时用默认 COLORS。"""
@@ -71,16 +114,33 @@ def colors_load():
 
 
 def colors_save(lst):
-    try:
-        with open(COLORS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"colors": lst}, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    _safe_write_json(COLORS_FILE, {"colors": lst})
 
 
 WIDTHS = [("细 1pt", 1.0), ("中 2pt", 2.0), ("粗 3.5pt", 3.5),
           ("特粗 5pt", 5.0), ("加粗 8pt", 8.0), ("最粗 12pt", 12.0)]
 RENDER_SCALE = 3.0  # 内部渲染倍数：直接以 用户倍率×RENDER_SCALE×屏幕dpr 高分辨率渲染，不降采样
+PAGE_PIX_BUDGET = 6_000_000     # 整页渲染的像素预算：超出即改走"只渲染视口可见区域"。
+                                # 整页纹理随缩放平方膨胀（常规页 200% 达 27Mpx），
+                                # 上传/绘制很卡；区域渲染像素量只与屏幕大小同级
+                                # （~1Mpx，与缩放无关），是高倍流畅的关键。
+MAX_PIX_DIM = 12000             # 单边像素上限：超过显卡纹理上限(常为16384)会使 QPixmap 变空 → 白屏
+REGION_GRID = 256               # 可见区域渲染的对齐网格（场景单位）：同格内滚动复用同一张图
+REGION_CACHE_MAX = 12           # 渲染缓存条数上限
+WORDS_CACHE_MAX = 4             # 文字词表缓存保留页数（当前页 + 少量邻页）
+REGION_PIX_BUDGET = 20_000_000   # 渲染缓存总像素预算（≈80MB）。QPixmap 每像素 4 字节，
+                                # 之前 120Mpx≈458MB 是内存失控的主因：翻页/缩放把
+                                # 缓存堆到 266MB+ 也不释放。视口附近通常只有 2~3 页、
+                                # 每页 ~2.4Mpx，80MB 足够覆盖数个缩放档位仍不重渲。
+REGION_MAX_PIXELS = 12_000_000   # 单次区域渲染的像素上限（≈48MB，4K 视口 8Mpx 仍够用；
+                                # 高 DPI 大视口时自动降倍，防纹理超限）
+ZOOM_RENDER_STEP = 1.25         # 渲染倍率档位：上取到 1.25 的幂，连续缩放多步复用同一批图
+ZOOM_PREVIEW_FACTOR = 1.0       # 缩放进行中的渲染系数（1.0=不低于屏幕分辨率，缩放中也不糊）
+ZOOM_REFINE_MS = 260            # 停止缩放多少毫秒后按最终档位重渲染
+REFINE_OVERSAMPLE = 1.0         # 不做额外超采样：按屏幕原生分辨率渲染（1:1）。
+                                # 额外超采样会让纹理成倍变大、每帧重采样更重，
+                                # 是"又卡又不清楚"的来源；改由 GPU 视口保证流畅。
+PAGE_GAP = 16      # 场景中页与页之间的间隔像素（浅灰底自然形成分隔）
 TOOLS = [("查看/拖动", "view"), ("选择文字", "selecttext"), ("选择批注", "selanno"),
          ("文字", "text"), ("文字高亮", "texthl")]
 # 画笔类工具合并为工具栏上一个"画笔"按钮：左键用当前画笔，右键弹菜单切换
@@ -95,6 +155,31 @@ import re as _re
 LEADER_DOTS_RE = _re.compile(r'^[\.\s]+$')          # 目录点连线: . / ... / 一长串点
 LEADER_LINE_RE = _re.compile(r'^[\.\-–—_\s]+$')     # 点/横线/下划线 组成的连线
 PAGE_NUM_RE = _re.compile(r'^\d{1,4}$')            # 独立页码
+
+# Altium 导出的原理图 PDF：子图在书签里带父图纸记号，形如
+#   pwr_efuse_mp5991_12vin_20a_compress<page101_i4>(121)
+#   block2<page24_fan_17>(106-108)
+# 尖括号内 pageN = 父图纸名（Altium 自动命名为 page1/page2/…，不是页码！），
+# 其后是实例名（i4 / fan_17 …）；括号内 = 子图所在页（可能是一段页范围）。
+# 注意：顶层图纸恰好按顺序排列，所以顶层条目的 N 看起来像页码，嵌套图纸
+# 就完全对不上（如 <page2> 实际是 PDF 第 108 页）——父页须靠书签树的
+# 层级关系推断，见 _hier_parent_page。
+HIER_TITLE_RE = _re.compile(
+    r'^(?P<name>.+?)\s*<page(?P<parent>\d+)_(?P<inst>[A-Za-z0-9_\-]+)>'
+    r'(?:\s*\((?P<pages>[\d\-]+)\))?\s*$', _re.IGNORECASE)
+
+# Altium 导出的 PDF 还会给每个 sheet 块放一个 Link 注释（内嵌 JS 动作），
+# 这是官方 Descend：/Rect 是该块的精确点击范围，/A 指向的 JS 里
+#   var name="Instance I4 of PWR_EFUSE_MP5991_12VIN_20A_COMPRESS";
+#   var dst="@LIB.SHEET(SCH_1):PAGE12135_I4@LIB.PWR_EFUSE_..._COMPRESS(SCH_1)";
+# dst 就是命名目标键，可直接查到真实页号。比书签推断精确得多：
+# 同页多个同名块也各有自己的 Rect，能精确区分点的是哪一个。
+ALT_RECT_RE = _re.compile(
+    r'/Rect\s*\[\s*([\d.\-]+)\s+([\d.\-]+)\s+([\d.\-]+)\s+([\d.\-]+)\s*\]')
+ALT_ACTION_RE = _re.compile(r'/A\s+(\d+)\s+0\s+R')
+ALT_NAME_RE = _re.compile(r'var\s+name="([^"]*)"')
+ALT_DST_RE = _re.compile(r'var\s+dst="([^"]*)"')
+ALT_INSTANCE_RE = _re.compile(r'Instance\s+(\S+)\s+of\s+(\S+)', _re.IGNORECASE)
 
 # ---------------- 最近打开历史（PDF管理） ----------------
 HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".pdf_anno_history.json")
@@ -113,11 +198,7 @@ def history_load():
 
 
 def history_save(lst):
-    try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump({"recent": lst[:HISTORY_MAX]}, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    _safe_write_json(HISTORY_FILE, {"recent": lst[:HISTORY_MAX]})
 
 
 def history_add(path):
@@ -139,6 +220,45 @@ def history_clear():
     history_save([])
 
 
+# ---------------- 阅读进度记忆（每个PDF的页码/缩放） ----------------
+PROGRESS_FILE = os.path.join(os.path.expanduser("~"), ".pdf_anno_progress.json")
+PROGRESS_MAX = 200   # 最多记住多少个文件的进度
+
+
+def progress_load():
+    try:
+        with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def progress_get(path):
+    """返回 (页码0基, 用户缩放倍率)；无记录返回 None。"""
+    rec = progress_load().get(path)
+    if isinstance(rec, dict):
+        try:
+            return int(rec.get("page", 0)), float(rec.get("zoom", 1.0))
+        except Exception:
+            return None
+    return None
+
+
+def progress_set(path, page, zoom):
+    """记录某 PDF 的阅读进度（超出上限时丢弃最旧的记录）。"""
+    if not path:
+        return
+    d = progress_load()
+    if path in d:
+        d.pop(path, None)
+    d[path] = {"page": int(page), "zoom": float(zoom)}
+    if len(d) > PROGRESS_MAX:   # 裁剪最旧（按插入顺序）
+        for k in list(d.keys())[: len(d) - PROGRESS_MAX]:
+            d.pop(k, None)
+    _safe_write_json(PROGRESS_FILE, d)
+
+
 # ---------------- 文件夹收藏（左侧PDF管理） ----------------
 FOLDERS_FILE = os.path.join(os.path.expanduser("~"), ".pdf_anno_folders.json")
 
@@ -154,11 +274,7 @@ def folders_load():
 
 
 def folders_save(lst):
-    try:
-        with open(FOLDERS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"folders": lst}, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    _safe_write_json(FOLDERS_FILE, {"folders": lst})
 
 
 # ---------------- 快捷键设置 ----------------
@@ -172,6 +288,7 @@ SHORTCUT_ACTIONS = [
     ("zoom_in", ("放大", "Ctrl++")),
     ("zoom_out", ("缩小", "Ctrl+-")),
     ("undo", ("撤销批注", "Ctrl+Z")),
+    ("redo", ("重做批注", "Ctrl+Y")),
     ("copy", ("复制选中文字", "Ctrl+C")),
     ("highlight", ("高亮选中文字", "H")),
     ("delete_anno", ("删除选中批注", "Delete")),
@@ -217,11 +334,7 @@ def translate_load():
 
 
 def translate_save(cfg):
-    try:
-        with open(TRANSLATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    _safe_write_json(TRANSLATE_FILE, cfg)
 
 
 def detect_lang(text):
@@ -498,11 +611,7 @@ def shortcuts_load():
 
 
 def shortcuts_save(cfg):
-    try:
-        with open(SHORTCUTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    _safe_write_json(SHORTCUTS_FILE, cfg)
 
 
 class NoteSettingsDialog(QDialog):
@@ -811,11 +920,7 @@ def notes_cfg_load():
 
 
 def notes_cfg_save(cfg):
-    try:
-        with open(NOTES_CFG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    _safe_write_json(NOTES_CFG_FILE, cfg)
 
 
 def notes_file_path():
@@ -830,6 +935,126 @@ def notes_img_dir_path():
     cfg = notes_cfg_load()
     d = cfg.get("img_dir", "").strip()
     return d if d else NOTES_IMG_DIR
+
+
+class HeadingGutter(QWidget):
+    """编辑区左侧的标题标尺：为每个标题行画 H1/H2… 徒标与折叠三角，
+    点击三角或徒标即可收起/展开该节。"""
+    WIDTH = 48
+
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.editor = editor
+        self.setMouseTracking(True)
+        self.setCursor(Qt.ArrowCursor)
+        self._hover = None     # 悬停的行号，用于突出显示
+        editor.document().contentsChanged.connect(self.update)
+        editor.document().documentLayout().documentSizeChanged.connect(
+            lambda *_: self.update())
+        editor.verticalScrollBar().valueChanged.connect(self.update)
+
+    # ---- 定位 ----
+    def _gutter_rect(self):
+        """标尺在编辑器窗口中的位置：左侧竖条，与视口同高。"""
+        vp = self.editor.viewport()
+        top = vp.mapTo(self.editor, vp.rect().topLeft()).y()
+        return QRect(0, top, self.WIDTH, vp.height())
+
+    def _rows(self):
+        """返回可见标题行的 [(block, y_in_gutter, height), ...]（文档坐标→标尺坐标）。"""
+        ed = self.editor
+        vp = ed.viewport()
+        top = vp.mapTo(ed, vp.rect().topLeft()).y()
+        off = ed.verticalScrollBar().value()
+        out = []
+        b = ed.document().firstBlock()
+        lay = ed.document().documentLayout()
+        while b.isValid():
+            lvl = b.blockFormat().headingLevel()
+            # 空段落（如清空后的残留格式）不画徒标，避免"没文字标题还在"
+            if lvl >= 1 and b.isVisible() and b.text().strip():
+                r = lay.blockBoundingRect(b)
+                y = top + r.y() - off
+                if -r.height() <= y - top <= vp.height():
+                    out.append((b, int(y), int(r.height()), lvl))
+            b = b.next()
+        return out
+
+    def _hit(self, pt):
+        """pt（标尺坐标）处命中的标题块，否则 None。"""
+        for blk, y, h, lvl in self._rows():
+            if y <= pt.y() <= y + h:
+                return blk, QRect(0, y, self.WIDTH, h)
+        return None, None
+
+    # ---- 绘制 ----
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        for blk, y, h, lvl in self._rows():
+            folded = self.editor.is_block_folded(blk)
+            hover = (self._hover == blk.position())
+            r = QRect(2, y, self.WIDTH - 4, h)
+            col = QColor("#1e88e5")
+            # 徒标背景 + H 级别文字
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("#e8f1fd") if hover else QColor("#f2f7fe"))
+            p.drawRoundedRect(QRect(r.x(), r.y() + 2, 22, r.height() - 4), 4, 4)
+            f = QFont()
+            f.setBold(True)
+            f.setPointSize(9)
+            p.setFont(f)
+            p.setPen(col)
+            p.drawText(QRect(r.x(), r.y(), 22, r.height()),
+                       Qt.AlignCenter, f"H{lvl}")
+            # 折叠三角（▾ 展开态 / ▸ 折叠态），画在徒标右侧
+            p.setPen(Qt.NoPen)
+            p.setBrush(col)
+            cx = r.x() + 31
+            cy = r.y() + r.height() // 2
+            if folded:   # 折叠：朝右
+                p.drawPolygon([QPoint(cx - 4, cy - 5), QPoint(cx - 4, cy + 5),
+                               QPoint(cx + 5, cy)])
+            else:        # 展开：朝下
+                p.drawPolygon([QPoint(cx - 5, cy - 3), QPoint(cx + 5, cy - 3),
+                               QPoint(cx, cy + 5)])
+
+    # ---- 交互 ----
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            blk, _ = self._hit(e.position().toPoint())
+            if blk is not None:
+                self.editor.toggle_fold_block(blk)
+                self._hover = blk.position()
+                self.update()
+                e.accept()
+                return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        blk, _ = self._hit(e.position().toPoint())
+        pos = blk.position() if blk is not None else None
+        if pos != self._hover:
+            self._hover = pos
+            self.update()
+            # 标尺区域是编辑器左留白，鼠标不一定进入编辑器，手动提示
+            if blk is not None:
+                act = "展开" if self.editor.is_block_folded(blk) else "收起"
+                self.setToolTip(f"{act}（点击 H{blk.blockFormat().headingLevel()} "
+                                f"标尺）")
+            else:
+                self.setToolTip("")
+        super().mouseMoveEvent(e)
+
+    def leaveEvent(self, e):
+        self._hover = None
+        self.update()
+        super().leaveEvent(e)
+
+    def wheelEvent(self, e):
+        """标尺是编辑器左侧延伸：滚轮直接作用到编辑器，保证滚动体验一致。"""
+        e.ignore()
+        self.editor.wheelEvent(e)
 
 
 class NoteEditor(QTextBrowser):
@@ -855,6 +1080,122 @@ class NoteEditor(QTextBrowser):
         self.selectionChanged.connect(self._on_selection_changed)
         # 滚动时选区位置会偏移，直接收起格式条（滚完重新选即可）
         self.verticalScrollBar().valueChanged.connect(self.fmt_bar.hide_bar)
+        # 折叠状态：记录哪些标题被折叠，随笔记一起保存
+        self._folded_keys = set()
+        # 左侧标题标尺（H1/H2 徒标 + 折叠三角）
+        self.gutter = HeadingGutter(self)
+        self.setViewportMargins(HeadingGutter.WIDTH, 0, 0, 0)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.gutter.setGeometry(self.gutter._gutter_rect())
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self.gutter.setGeometry(self.gutter._gutter_rect())
+        self.gutter.raise_()
+
+    # ---- 标题折叠 ----
+    def heading_at(self, pt):
+        """视图坐标 pt 处若在**有文字**的标题段落上，返回该 QTextBlock，否则 None。"""
+        blk = self.cursorForPosition(pt).block()
+        if blk.blockFormat().headingLevel() >= 1 and blk.text().strip():
+            return blk
+        return None
+
+    def toggle_fold_at(self, pt):
+        """双击标题：折叠/展开该标题下辖内容。返回是否有处理。"""
+        blk = self.heading_at(pt)
+        if blk is None:
+            return False
+        self.toggle_fold_block(blk)
+        return True
+
+    def toggle_fold_block(self, blk):
+        key = self._fold_key(blk)
+        if key in self._folded_keys:
+            self._folded_keys.discard(key)
+            self._set_section_visible(blk, True)
+        else:
+            self._folded_keys.add(key)
+            self._set_section_visible(blk, False)
+        self.gutter.update()
+        self._notify_fold_changed()
+
+    def is_block_folded(self, blk):
+        """该标题块当前是否处于折叠状态。"""
+        return self._fold_key(blk) in self._folded_keys
+
+    def _fold_key(self, blk):
+        """折叠状态键：标题级别 + 标题文本 + 出现序号（同文本多标题也能各自独立）。"""
+        lvl = blk.blockFormat().headingLevel()
+        text = blk.text().strip()
+        n = 0
+        b = self.document().firstBlock()
+        while b.isValid() and b.position() < blk.position():
+            if (b.blockFormat().headingLevel() == lvl
+                    and b.text().strip() == text):
+                n += 1
+            b = b.next()
+        return f"{lvl}|{text}|{n}"
+
+    def _section_blocks(self, blk):
+        """返回该标题下辖的内容块（到下一个同级或更高级标题之前，不含标题自身）。"""
+        lvl = blk.blockFormat().headingLevel()
+        out = []
+        b = blk.next()
+        while b.isValid():
+            bl = b.blockFormat().headingLevel()
+            if bl >= 1 and bl <= lvl:
+                break
+            out.append(b)
+            b = b.next()
+        return out
+
+    def _set_section_visible(self, blk, visible):
+        for b in self._section_blocks(blk):
+            b.setVisible(visible)
+        # 让布局重新计算（否则隐藏块仍占位）
+        self.document().markContentsDirty(0, self.document().characterCount())
+
+    def _iter_blocks(self):
+        b = self.document().firstBlock()
+        while b.isValid():
+            yield b
+            b = b.next()
+
+    def _notify_fold_changed(self):
+        if self.note_panel is not None:
+            self.note_panel._on_fold_changed()
+
+    def folded_keys(self):
+        return sorted(self._folded_keys)
+
+    def apply_folded_keys(self, keys):
+        """笔记加载后恢复折叠状态；顺带丢弃已不存在标题的过期记录。"""
+        want = set(keys or [])
+        self._folded_keys = set()
+        for b in self._iter_blocks():
+            b.setVisible(True)
+        for blk in self._iter_blocks():
+            if blk.blockFormat().headingLevel() < 1:
+                continue
+            k = self._fold_key(blk)
+            if k in want:
+                self._folded_keys.add(k)
+                for b in self._section_blocks(blk):
+                    b.setVisible(False)
+        self.document().markContentsDirty(
+            0, self.document().characterCount())
+        self.gutter.update()
+
+    def mouseDoubleClickEvent(self, e):
+        """双击标题行 → 折叠/展开该节内容。"""
+        if e.button() == Qt.LeftButton and self.toggle_fold_at(
+                e.position().toPoint()):
+            e.accept()
+            return
+        super().mouseDoubleClickEvent(e)
 
     def _on_selection_changed(self):
         self._refresh_fmt_bar()
@@ -870,14 +1211,27 @@ class NoteEditor(QTextBrowser):
             self.fmt_bar.hide_bar()
 
     def focusOutEvent(self, e):
-        # 焦点离开编辑器时收起格式条；但点格式条自身（如字号下拉）不算
+        # 焦点离开编辑器时收起格式条；但点到格式条自身/其下拉弹层不算。
+        # 延迟到下一轮事件循环再判断：此时新焦点与弹层状态才已就绪。
+        super().focusOutEvent(e)
+        QTimer.singleShot(0, self._hide_bar_if_focus_left)
+
+    def _hide_bar_if_focus_left(self):
+        """焦点确实离开编辑器与格式条（含下拉弹层）时，才收起格式条。"""
+        if not self.fmt_bar.isVisible():
+            return
         w = QApplication.focusWidget()
         if w is not None and (w is self.fmt_bar
                               or self.fmt_bar.isAncestorOf(w)):
-            super().focusOutEvent(e)
+            return
+        pop = QApplication.activePopupWidget()
+        if pop is not None and (pop is self.fmt_bar
+                                or self.fmt_bar.isAncestorOf(pop)):
+            return
+        # 字号/标题下拉的弹层是独立顶层窗口，需单独判断其可见性
+        if self.fmt_bar.popup_open():
             return
         self.fmt_bar.hide_bar()
-        super().focusOutEvent(e)
 
     # ---- 粘贴 ----
     def _mime_image(self, source):
@@ -1032,7 +1386,61 @@ class NoteEditor(QTextBrowser):
         cur.insertImage(imgfmt)
         return True
 
-    # ---- 鼠标交互 ----
+    # ---- 交互 ----
+    EDGE_MARGIN = 36   # 距视口边缘多少像素内触发自动滚动
+    EDGE_STEP = 24     # 每步滚动像素
+
+    def _edge_delta(self, vp):
+        """按鼠标视口坐标算边缘自动滚动的 (dx, dy)；不需滚动返回 (0, 0)。"""
+        if vp is None:
+            return 0, 0
+        w, h = self.viewport().width(), self.viewport().height()
+        x, y = vp.x(), vp.y()
+        dx = dy = 0
+
+        def amt(pos, size):
+            m = self.EDGE_MARGIN
+            if pos < m:
+                # 越靠边滚得越快（1~2 倍步长）
+                return -int(self.EDGE_STEP * (1 + (m - max(0, pos)) / m))
+            if pos > size - m:
+                return int(self.EDGE_STEP * (1 + (pos - (size - m)) / m))
+            return 0
+
+        dx = amt(x, w)
+        dy = amt(y, h)
+        return dx, dy
+
+    def _update_edge_scroll(self):
+        """根据最近鼠标位置启停边缘自动滚动定时器。"""
+        dx, dy = self._edge_delta(self._last_vp)
+        if self.win.drawing and (dx or dy):
+            if not self._edge_timer.isActive():
+                self._edge_timer.start()
+        else:
+            self._edge_timer.stop()
+
+    def _auto_scroll_step(self):
+        """定时器：滚动视图并把拖拽预览延伸到新的鼠标位置。"""
+        if not self.win.drawing or self._last_vp is None:
+            self._edge_timer.stop()
+            return
+        dx, dy = self._edge_delta(self._last_vp)
+        if not dx and not dy:
+            self._edge_timer.stop()
+            return
+        hsb = self.horizontalScrollBar()
+        vsb = self.verticalScrollBar()
+        hsb.setValue(hsb.value() + dx)
+        vsb.setValue(vsb.value() + dy)
+        # 滚动后用同一鼠标位置重算预览（场景坐标已随滚动移动）
+        sp = self.mapToScene(self._last_vp)
+        self.win.on_move_to(sp)
+        # 滚到头了（值没变）则停表，避免空转
+        if hsb.value() == hsb.minimum() and dx < 0 or \
+                vsb.value() == vsb.maximum() and dy > 0:
+            self._edge_timer.stop()
+
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             pt = e.position().toPoint()
@@ -1139,6 +1547,11 @@ class FloatingFormatBar(QFrame):
     """在笔记编辑器里选中文字后浮出的小格式条，可就地编辑选中文字。
     作为窗口的子控件存在，内部按钮全部 NoFocus，点击时不会打断编辑器选区。"""
 
+    # 段落标题级别：下拉显示名 → （headingLevel, 字号pt）
+    HEADINGS = [("正文", 0), ("标题 1", 1), ("标题 2", 2),
+                ("标题 3", 3), ("标题 4", 4)]
+    HEADING_PT = {0: 14.0, 1: 26.0, 2: 22.0, 3: 18.0, 4: 16.0}
+
     def __init__(self, editor):
         super().__init__(editor.viewport())
         self.editor = editor
@@ -1180,6 +1593,17 @@ class FloatingFormatBar(QFrame):
         lay.addWidget(self.btn_size)
 
         self._sep(lay)
+        # 标题级别下拉：正文 / 标题1~4
+        self.btn_heading = QComboBox()
+        self.btn_heading.setFocusPolicy(Qt.NoFocus)
+        self.btn_heading.setToolTip("段落标题级别（作用于光标所在段落）")
+        self.btn_heading.setMinimumWidth(66)
+        for name, lvl in self.HEADINGS:
+            self.btn_heading.addItem(name, lvl)
+        self.btn_heading.activated.connect(self._on_heading)
+        lay.addWidget(self.btn_heading)
+
+        self._sep(lay)
         self.btn_bold = mk("B", "加粗", lambda: self._toggle("bold"))
         self.btn_bold.setStyleSheet("font-weight:bold;")
         self.btn_italic = mk("I", "斜体", lambda: self._toggle("italic"))
@@ -1188,6 +1612,8 @@ class FloatingFormatBar(QFrame):
         self.btn_under.setStyleSheet("text-decoration:underline;")
         self.btn_strike = mk("S", "删除线", lambda: self._toggle("strike"))
         self.btn_strike.setStyleSheet("text-decoration:line-through;")
+        self.btn_sup = mk("x²", "上标", lambda: self._toggle("superscript"))
+        self.btn_sub = mk("x₂", "下标", lambda: self._toggle("subscript"))
         self._sep(lay)
         self.btn_color = mk("A", "文字颜色", self._pick_color)
         self.btn_color.setStyleSheet("color:#d84315; font-weight:bold;")
@@ -1231,16 +1657,26 @@ class FloatingFormatBar(QFrame):
         x = max(2, min(x, vp.width() - self.width() - 2))
         y = max(2, min(y, vp.height() - self.height() - 2))
         self.move(x, y)
-        self._sync_size()
+        self._sync_state()
         self.raise_()
         self.show()
 
     def hide_bar(self, *args):
         self.hide()
 
+    def popup_open(self):
+        """任一字号/标题下拉的弹层当前是否已展开。"""
+        for cb in (self.btn_size, self.btn_heading):
+            view = cb.view()
+            if view is not None:
+                w = view.window()
+                if w is not None and w.isVisible():
+                    return True
+        return False
+
     # ---- 应用格式 ----
-    def _sync_size(self):
-        """把字号下拉同步为选区当前字号。"""
+    def _sync_state(self):
+        """把字号/标题下拉同步为选区当前状态。"""
         cur = self.editor.textCursor()
         size = cur.charFormat().fontPointSize()
         if size <= 0:
@@ -1250,6 +1686,12 @@ class FloatingFormatBar(QFrame):
             self.btn_size.blockSignals(True)
             self.btn_size.setCurrentIndex(idx)
             self.btn_size.blockSignals(False)
+        lvl = cur.blockFormat().headingLevel()
+        hidx = self.btn_heading.findData(lvl)
+        if hidx >= 0:
+            self.btn_heading.blockSignals(True)
+            self.btn_heading.setCurrentIndex(hidx)
+            self.btn_heading.blockSignals(False)
 
     def _apply(self, fn):
         cur = self.editor.textCursor()
@@ -1277,6 +1719,18 @@ class FloatingFormatBar(QFrame):
             f.setFontUnderline(not src.fontUnderline())
         elif prop == "strike":
             f.setFontStrikeOut(not src.fontStrikeOut())
+        elif prop == "superscript":
+            f.setVerticalAlignment(
+                QTextCharFormat.VerticalAlignment.AlignNormal
+                if src.verticalAlignment()
+                == QTextCharFormat.VerticalAlignment.AlignSuperScript
+                else QTextCharFormat.VerticalAlignment.AlignSuperScript)
+        elif prop == "subscript":
+            f.setVerticalAlignment(
+                QTextCharFormat.VerticalAlignment.AlignNormal
+                if src.verticalAlignment()
+                == QTextCharFormat.VerticalAlignment.AlignSubScript
+                else QTextCharFormat.VerticalAlignment.AlignSubScript)
         self._apply(lambda c: c.mergeCharFormat(f))
 
     def _on_size(self):
@@ -1286,6 +1740,36 @@ class FloatingFormatBar(QFrame):
         f = QTextCharFormat()
         f.setFontPointSize(float(size))
         self._apply(lambda c: c.mergeCharFormat(f))
+
+    def _on_heading(self):
+        """设置选区所在段落的标题级别（标题 1~4），并套用对应字号/加粗。
+        标题是段落级格式，作用于选区覆盖的所有完整段落。"""
+        lvl = self.btn_heading.currentData()
+        if lvl is None:
+            return
+        self._apply(lambda c: self._apply_heading(c, lvl))
+
+    def _apply_heading(self, cur, lvl):
+        """对 cur 选区覆盖的每个段落应用 headingLevel 与配套字号/加粗。"""
+        doc = self.editor.document()
+        start = doc.findBlock(cur.selectionStart()).position()
+        end_blk = doc.findBlock(cur.selectionEnd())
+        end = end_blk.position() + end_blk.length() - 1
+        sub = QTextCursor(doc)
+        sub.setPosition(start)
+        sub.setPosition(end, QTextCursor.KeepAnchor)
+        pt = self.HEADING_PT.get(lvl, 14.0)
+        bf = QTextBlockFormat()
+        bf.setHeadingLevel(int(lvl))
+        # 标题按层级套字号与加粗；正文恢复常规
+        cf = QTextCharFormat()
+        cf.setFontPointSize(pt)
+        cf.setFontWeight(QFont.Bold if lvl >= 1 else QFont.Normal)
+        sub.mergeBlockFormat(bf)
+        sub.mergeCharFormat(cf)
+        # 让原选区仍覆盖这些段落
+        cur.setPosition(start)
+        cur.setPosition(end, QTextCursor.KeepAnchor)
 
     def _pick_color(self):
         cur = self.editor.textCursor()
@@ -1306,7 +1790,11 @@ class FloatingFormatBar(QFrame):
             self._apply(lambda cc: cc.mergeCharFormat(f))
 
     def _clear_format(self):
-        self._apply(lambda c: c.setCharFormat(QTextCharFormat()))
+        """清除字符格式，并把段落恢复为正文。"""
+        def _do(c):
+            c.setCharFormat(QTextCharFormat())
+            self._apply_heading(c, 0)
+        self._apply(_do)
 
 
 class NotePanel(QWidget):
@@ -1366,12 +1854,24 @@ class NotePanel(QWidget):
             self._on_list_context_menu)
         llay.addWidget(self.note_list, 1)
 
-        # ============ 右侧：格式栏 + 编辑器 ============
+        # ============ 右侧：标题栏 + 格式栏 + 编辑器 ============
         self.editor_ui = QWidget()
         self.editor_ui.setMinimumWidth(300)
         ebl = QVBoxLayout(self.editor_ui)
         ebl.setContentsMargins(0, 0, 0, 0)
         ebl.setSpacing(0)
+
+        # 笔记标题：与左侧列表中的笔记名同步
+        self.title_edit = QLineEdit()
+        self.title_edit.setPlaceholderText("请输入标题")
+        self.title_edit.setToolTip("笔记标题（会自动同步为左侧列表中的笔记名）")
+        self.title_edit.setStyleSheet(
+            "QLineEdit { border:none; border-bottom:1px solid #e0e0e0;"
+            " background:transparent; font-size:20px; font-weight:bold;"
+            " color:#212121; padding:8px 10px 6px 10px; }"
+            "QLineEdit:focus { border-bottom:1px solid #1e88e5; }")
+        self.title_edit.textEdited.connect(self._on_title_edited)
+        ebl.addWidget(self.title_edit)
 
         # 编辑工具栏
         fmt_bar = QHBoxLayout()
@@ -1417,6 +1917,12 @@ class NotePanel(QWidget):
         self._save_timer.timeout.connect(self.save_current)
         self._save_pending = False
 
+        # ---- 标题编辑防抖：避免每敲一个字就读写 JSON + 重建列表 ----
+        self._title_timer = QTimer(self)
+        self._title_timer.setSingleShot(True)
+        self._title_timer.timeout.connect(self._commit_title)
+        self._title_pending = None
+
         # 加载已有笔记列表
         self.refresh_list()
 
@@ -1441,16 +1947,19 @@ class NotePanel(QWidget):
         return {k: v for k, v in d.items() if isinstance(v, dict)}
 
     def _save_notes(self, data):
-        """原子写入+重试：避免文件被杀毒软件等短暂锁定时静默丢失数据。"""
+        """原子写入+重试：避免文件被杀毒软件等短暂锁定时静默丢失数据。
+        成功返回 True；5 次均失败返回 False 并记录错误（由调用方统一提示）。"""
         path = notes_file_path()
         tmp = path + ".tmp"
+        last_err = None
         for attempt in range(5):
             try:
                 with open(tmp, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
                 os.replace(tmp, path)
-                return
-            except Exception:
+                return True
+            except Exception as e:
+                last_err = e
                 if attempt == 4:
                     try:
                         os.remove(tmp)
@@ -1458,6 +1967,8 @@ class NotePanel(QWidget):
                         pass
                 else:
                     time.sleep(0.05 * (attempt + 1))
+        _SAVE_ERRORS.append((path, str(last_err)))
+        return False
 
     # ---- 列表管理 ----
     def refresh_list(self, keep_id=None):
@@ -1548,7 +2059,7 @@ class NotePanel(QWidget):
         self.refresh_list(keep_id=nid)
         self._load_note(nid)
         self.show_editor()
-        self.editor.setFocus()
+        self.title_edit.setFocus()   # 新建后光标落在标题，直接输入标题
         self.win.statusBar().showMessage(f"已新建笔记: {title}", 3000)
 
     def delete_note(self, nid=None):
@@ -1595,6 +2106,10 @@ class NotePanel(QWidget):
         data[nid]["title"] = name.strip()
         self._save_notes(data)
         self.refresh_list(keep_id=nid)
+        if nid == self._current_id:
+            self._loading = True
+            self.title_edit.setText(name.strip())
+            self._loading = False
 
     # ---- 绑定 PDF ----
     def export_note(self, nid=None, fmt=None):
@@ -1746,8 +2261,10 @@ class NotePanel(QWidget):
         data = self._all_notes()
         for nid, info in data.items():
             if info.get("pdf_path") == pdf_path:
-                self._load_note(nid)
-                self.refresh_list(keep_id=nid)
+                # 已是当前笔记：不再重载，避免打断编辑/覆盖未保存内容
+                if nid != self._current_id:
+                    self._load_note(nid)
+                    self.refresh_list(keep_id=nid)
                 # 正停在笔记列表页时，同步弹出编辑器；否则只静默加载
                 st = getattr(self.win, "left_stack", None)
                 if st is not None and st.isVisible() and st.currentIndex() == 2:
@@ -1756,17 +2273,48 @@ class NotePanel(QWidget):
         # 没有绑定的笔记：不打扰，保持当前编辑状态
 
     def _load_note(self, nid):
-        """加载某篇笔记到编辑器（先保存当前笔记，除非正在切换到同一篇）。"""
-        if self._current_id and self._current_id != nid:
+        """加载某篇笔记到编辑器。
+        先保存当前编辑器内容：同一篇重载也必须先落盘，
+        否则磁盘旧内容会覆盖掉未保存的编辑（表现为"笔记内容莫名变空"）。"""
+        if self._current_id:
             self.save_current()
         self._current_id = nid
         data = self._all_notes()
         info = data.get(nid, {})
         self._loading = True
         self.editor.setHtml(info.get("html", ""))
+        self.editor.apply_folded_keys(info.get("folded", []))
+        self.title_edit.setText(info.get("title", ""))
         self._loading = False
         self.editor.fmt_bar.hide_bar()
         self._save_pending = False
+        self._title_pending = None
+
+    def _on_title_edited(self, text):
+        """标题框输入：仅记录待提交标题，防抖后再写盘+刷新列表。"""
+        if self._loading or not self._current_id:
+            return
+        self._title_pending = text.strip()
+        self._save_pending = True
+        self._save_timer.start(2000)
+        self._title_timer.start(400)   # 停止输入 400ms 后才真正写入
+
+    def _commit_title(self):
+        """把防抖后的标题写入笔记并刷新列表。"""
+        if self._title_pending is None or not self._current_id:
+            return
+        title = self._title_pending
+        self._title_pending = None
+        self._set_title(self._current_id, title)
+        self.refresh_list(keep_id=self._current_id)
+
+    def _set_title(self, nid, title):
+        """写入笔记标题（空标题回退为占位名，避免列表中不可见）。"""
+        data = self._all_notes()
+        if nid not in data:
+            return
+        data[nid]["title"] = title or "未命名"
+        self._save_notes(data)
 
     # ---- 格式化 ----
     def fmt_bold(self):
@@ -1916,13 +2464,29 @@ class NotePanel(QWidget):
         if not self._current_id:
             return
         self._save_timer.stop()
+        # 有未提交的标题改动：先落盘并刷新列表，避免切换/退出时丢失
+        if self._title_pending is not None:
+            self._title_timer.stop()
+            self._commit_title()
         html = self.editor.toHtml()
         data = self._all_notes()
         if self._current_id not in data:
             return
         data[self._current_id]["html"] = html
-        self._save_notes(data)
-        self._save_pending = False
+        data[self._current_id]["folded"] = self.editor.folded_keys()
+        if self._save_notes(data):
+            self._save_pending = False
+        else:
+            # 写盘失败：保留待保存标记，提示用户（下次改动会自动再试）
+            self._save_pending = True
+            flush_save_errors(self)
+
+    def _on_fold_changed(self):
+        """折叠状态变化：标记待保存（走自动保存定时器）。"""
+        if self._loading or not self._current_id:
+            return
+        self._save_pending = True
+        self._save_timer.start(2000)
 
 
 def hex_rgb(h):
@@ -2169,22 +2733,29 @@ class TextEditorItem(QGraphicsTextItem):
         self._done = True
         if txt:
             z = self.win.zoom
-            px, py = self.pos().x() / z, self.pos().y() / z
+            pno = self.win._page_at_scroll(self.pos().y())
+            ox, oy = self.win._page_origin(pno)
+            px, py = (self.pos().x() - ox) / z, (self.pos().y() - oy) / z
             if self.edit_anno is not None:
                 # 编辑模式：原地更新批注内容与字号，不新增
+                before = self.win._snapshot_page(pno)
                 self.edit_anno["text"] = txt
                 self.edit_anno["fs"] = self.fs_pt
-                self.win.rebuild_items()
+                self.win._refresh_page_annos(pno)
+                self.win._push_undo(pno, before)
             else:
                 a = {"type": "text", "p": (px, py), "text": txt, "fs": self.fs_pt,
                      "color": self.color_hex, "rgb": hex_rgb(self.color_hex), "wpt": 1}
-                self.win._add_anno_to_scene(a)
+                self.win._add_anno_to_scene(a, pno=pno)
         elif self.edit_anno is not None:
             # 编辑模式清空文字 = 删除该批注
-            lst = self.win.annos.get(self.win.page_no, [])
+            pno = self.win._page_at_scroll(self.pos().y())
+            lst = self.win.annos.get(pno, [])
             if self.edit_anno in lst:
+                before = self.win._snapshot_page(pno)
                 lst.remove(self.edit_anno)
-            self.win.rebuild_items()
+                self.win._refresh_page_annos(pno)
+                self.win._push_undo(pno, before)
         self.finish()
 
     def finish(self, cancel=False):
@@ -2208,11 +2779,27 @@ class Canvas(QGraphicsView):
         self.win = win
         self._mid = False
         self._rs = None     # 文字批注缩放状态：{"idx", "item", "fs0", "h0"}
+        # 拖拽到窗口边缘时的自动滚动（否则选不全屏幕外的文字/画不到边缘）
+        self._last_vp = None       # 最近一次鼠标视口坐标
+        self._edge_timer = QTimer(self)
+        self._edge_timer.setInterval(30)
+        self._edge_timer.timeout.connect(self._auto_scroll_step)
         self.setRenderHint(QPainter.Antialiasing)
-        self.setRenderHint(QPainter.SmoothPixmapTransform)
         self.setRenderHint(QPainter.TextAntialiasing)        # 文字抗锯齿
         self.setBackgroundBrush(QColor("#e8e8e8"))  # 浅灰底：页面白纸浮于其上
         self.setMouseTracking(True)  # 确保始终收到 mouseMoveEvent
+        # 页面是静态位图，用 GPU 视口绘制（纹理合成走显卡），大页滚动/缩放明显更顺。
+        # 图元各自已设 SmoothTransformation，无需再开视图级 SmoothPixmapTransform
+        # （那会让每帧对整屏位图做一次 CPU 平滑重采样，是卡顿主因）。
+        # 个别机器（远程桌面/老驱动）GL 视口可能画不出内容，可设环境变量
+        # PDFANNO_GPU=0 退回默认光栅视口。
+        if os.environ.get("QT_QPA_PLATFORM", "") != "offscreen" and \
+                os.environ.get("PDFANNO_GPU", "1") != "0":
+            try:
+                from PySide6.QtOpenGLWidgets import QOpenGLWidget
+                self.setViewport(QOpenGLWidget())
+            except Exception:
+                pass
 
     def _text_hit(self, sp):
         """selanno 工具下检测点击是否落在文字批注的右下角缩放柄上。
@@ -2227,7 +2814,63 @@ class Canvas(QGraphicsView):
                     return it, idx
         return None, None
 
+    EDGE_MARGIN = 36   # 距视口边缘多少像素内触发自动滚动
+    EDGE_STEP = 24     # 每步滚动像素
+
+    def _edge_delta(self, vp):
+        """按鼠标视口坐标算边缘自动滚动的 (dx, dy)；不需滚动返回 (0, 0)。"""
+        if vp is None:
+            return 0, 0
+        w, h = self.viewport().width(), self.viewport().height()
+        dx = dy = 0
+
+        def amt(pos, size):
+            m = self.EDGE_MARGIN
+            if pos < m:
+                # 越靠边滚得越快（1~2 倍步长）
+                return -int(self.EDGE_STEP * (1 + (m - max(0, pos)) / m))
+            if pos > size - m:
+                return int(self.EDGE_STEP * (1 + (pos - (size - m)) / m))
+            return 0
+
+        dx = amt(vp.x(), w)
+        dy = amt(vp.y(), h)
+        return dx, dy
+
+    def _update_edge_scroll(self):
+        """根据最近鼠标位置启停边缘自动滚动定时器。"""
+        dx, dy = self._edge_delta(self._last_vp)
+        if self.win.drawing and (dx or dy):
+            if not self._edge_timer.isActive():
+                self._edge_timer.start()
+        else:
+            self._edge_timer.stop()
+
+    def _auto_scroll_step(self):
+        """定时器：滚动视图并把拖拽预览延伸到新的鼠标位置。"""
+        if not self.win.drawing or self._last_vp is None:
+            self._edge_timer.stop()
+            return
+        dx, dy = self._edge_delta(self._last_vp)
+        if not dx and not dy:
+            self._edge_timer.stop()
+            return
+        hsb = self.horizontalScrollBar()
+        vsb = self.verticalScrollBar()
+        old_h, old_v = hsb.value(), vsb.value()
+        hsb.setValue(old_h + dx)
+        vsb.setValue(old_v + dy)
+        # 滚动后用同一鼠标位置重算预览（场景坐标随滚动移动），实现"边滚边选"
+        self.win.on_move_to(self.mapToScene(self._last_vp))
+        # 滚到头（值没变）则停表，避免空转
+        if hsb.value() == old_h and vsb.value() == old_v:
+            self._edge_timer.stop()
+
     def mousePressEvent(self, e):
+        # 右键：交给默认处理，让 contextMenuEvent 正常弹出层级菜单
+        if e.button() == Qt.RightButton:
+            super().mousePressEvent(e)
+            return
         # 中键按下 = 临时抓手平移（任意工具下可用）
         if e.button() == Qt.MiddleButton and self.win.doc:
             self.setDragMode(QGraphicsView.ScrollHandDrag)
@@ -2242,9 +2885,9 @@ class Canvas(QGraphicsView):
         if e.button() == Qt.LeftButton and self.win.tool == "selanno" and self.win.doc:
             it, idx = self._text_hit(self.win.scene_pos(e))
             if it is not None:
-                a = self.win.annos[self.win.page_no][idx]
-                z = self.win.zoom
-                self._rs = {"idx": idx, "item": it, "fs0": a["fs"],
+                rp = self.win._page_at_scroll(it.sceneBoundingRect().center().y())
+                a = self.win.annos[rp][idx]
+                self._rs = {"idx": idx, "item": it, "fs0": a["fs"], "page": rp,
                             "h0": max(1.0, it.sceneBoundingRect().height())}
                 self.setCursor(Qt.SizeFDiagCursor)
                 e.accept()
@@ -2252,24 +2895,29 @@ class Canvas(QGraphicsView):
         # 绘图工具：直接 accept，不调 super()（避免基类修改事件/坐标）
         # setMouseTracking(True) + accept 足以保证后续 mouseMoveEvent 到达
         if self.win.doc and self.win.tool not in ("view", "selanno"):
+            self._last_vp = e.position().toPoint()
             self.win.on_press(e)
             e.accept()
         else:
             super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
+        self._last_vp = e.position().toPoint()
+        # 拖拽到边缘时启用自动滚动（滚动条走到头会自动停）
+        self._update_edge_scroll()
         # 文字缩放拖动中：按高度比例缩放字号并实时重建
         if self._rs is not None:
             sp = self.win.scene_pos(e)
             it = self._rs["item"]
             h0 = self._rs["h0"]
+            rp = self._rs.get("page", self.win.page_no)
             if h0 > 0:
                 ratio = max(0.15, (sp.y() - it.pos().y()) / h0)
                 fs = max(4, min(200, self._rs["fs0"] * ratio))
-                lst = self.win.annos[self.win.page_no]
+                lst = self.win.annos[rp]
                 if 0 <= self._rs["idx"] < len(lst) and lst[self._rs["idx"]]:
                     lst[self._rs["idx"]]["fs"] = fs
-                    self.win.rebuild_items()
+                    self.win._refresh_page_annos(rp)
                     # rebuild 后图元重建，找回对应项
                     for x in self.win.scene.items():
                         if x.data(0) == self._rs["idx"] and x.data(1) == "text" and \
@@ -2284,6 +2932,7 @@ class Canvas(QGraphicsView):
             super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
+        self._edge_timer.stop()   # 松开鼠标：停止边缘自动滚动
         if self._rs is not None:
             self._rs = None
             self.setCursor(Qt.ArrowCursor)
@@ -2332,6 +2981,22 @@ class Canvas(QGraphicsView):
             return
         super().mouseDoubleClickEvent(e)
 
+    def contextMenuEvent(self, e):
+        """右键菜单：Altium 原理图的 Descend（进入子图）/ Ascend（返回上级）。
+
+        仅当文档的书签里带 Altium 层级记号 <pageN_iM> 时才提供，普通 PDF
+        不弹菜单，保持原有交互不变。"""
+        if not self.win.doc:
+            super().contextMenuEvent(e)
+            return
+        sp = self.mapToScene(e.pos())
+        menu = self.win.build_hier_menu(sp)
+        if menu is None:
+            super().contextMenuEvent(e)
+            return
+        menu.exec(e.globalPos())
+        e.accept()
+
     def wheelEvent(self, e):
         if e.modifiers() & Qt.ControlModifier:
             # 以鼠标位置为锚点缩放（缩放后鼠标下内容保持不动）
@@ -2339,23 +3004,7 @@ class Canvas(QGraphicsView):
                                (e.position().x(), e.position().y()))
             e.accept()
             return
-        d = e.angleDelta().y()
-        sb = self.verticalScrollBar()
-        vh = self.viewport().height()
-        # 翻页阈值=当前页完全滚出视口（而非滚完整段邻页预览）；
-        # 翻页后按预览中正看到的内容落点 → 无缝连续滚动，不会"跳回重看一页"
-        next_y = getattr(self.win, "_next_y", None)
-        prev_h = getattr(self.win, "_prev_h", 0)
-        if d < 0 and next_y is not None and sb.value() >= min(sb.maximum(), next_y):
-            # 下滑：视口顶已过本页底 → 翻下一页，落点=预览里已看到的位置
-            if self.win.turn_page(1, land=sb.value() - next_y):
-                e.accept()
-                return
-        elif d > 0 and prev_h and sb.value() <= max(sb.minimum(), -vh):
-            # 上滑：视口底已到本页顶 → 翻上一页，落点=预览里已看到的位置
-            if self.win.turn_page(-1, land=sb.value() + prev_h):
-                e.accept()
-                return
+        # 整篇文档连续滚动：滚轮交给基类滚动视图（跨页自然衔接，无需"翻页阈值"）
         super().wheelEvent(e)
 
 
@@ -2657,19 +3306,54 @@ class MainWindow(QMainWindow):
 
         self.drawing = False
         self.start = None          # QPointF 场景坐标
+        self._draw_page = 0        # 本次绘制落在哪一页（连续滚动时≠当前页）
         self.free_pts = []
         self.preview_items = []
         self._pen_item = None      # 画笔/荧光笔的实时路径图元
+        self._undo_stack = []      # 跨页撤销栈：[{page, before, after}]（批注深拷贝）
+        self._redo_stack = []      # 跨页重做栈
 
         self.sel_items = []        # 文字选择高亮图元
         self.sel_text = ""         # 当前选中的文字
         self.sel_hits = []         # 选中词 [(页号, 词数据)]，跨页选择时含上下邻页的词
-        self._words_cache = {}     # 页号 -> 词表缓存（当前页 + 上下邻页）
-        self._scene_page_rects = {}  # 页号 -> 该页在场景中的矩形（当前页 + 邻页预览）
+        self._words_cache = OrderedDict()   # 页号 -> 词表（按访问顺序有限保留）
+        self._scene_page_rects = {}  # 页号 -> 该页在场景中的矩形（整篇文档坐标系）
+        self._page_tops = []       # 页号 -> 该页顶边在场景中的 y（整篇文档坐标系）
+        self._page_lefts = []      # 页号 -> 该页左边在场景中的 x（各页横向居中）
+        self._page_sizes = []      # 页号 -> (宽, 高)（场景单位）
+        self._doc_scene_h = 0.0    # 整篇文档场景总高
+        self._doc_scene_w = 0.0    # 整篇文档场景总宽（取最宽页）
+        self._rendered_pages = {}  # 页号 -> 已渲染图元列表（窗口化：只留在视口附近的页）
+        self._sync_scroll = False  # 程序内调整滚动条时屏蔽"滚动→切页"联动
+        self._rendering = False    # 正在重建场景/窗口化渲染（屏蔽滚动信号重入）
         self._text_editor = None   # 画布内联文字输入框（"文字"工具）
+        self._zooming_fast = False  # 快速连续缩放中：按档位渲染（不低于屏幕分辨率）
+        self._zooming_refined = True  # 稳态（缩放/翻页停止后）：2~3 倍超采样，画面更锐利
+        self._hier_index = None     # Altium 层级子图索引（书签推断，见 _ensure_hier_index）
+        self._hier_sig = -1         # 构建时的书签条数（书签变化时触发重建）
+        self._alt_map = {}          # 页号 -> [(条目, 点击矩形)]（Altium 原生 Descend 链接）
+        self._alt_parent = {}       # 子图页 -> 父页（来自原生链接）
+        self._alt_sig = -1          # 缓存对应的 doc id
+        self._alt_doc = None        # 缓存对应的 doc 对象（防 id 复用）
+        self._alt_ready = False
 
         self.scene = QGraphicsScene(self)
         self.view = Canvas(self)
+        self._page_pix_items = {}   # 页号 -> [页面图元, 边框图元]（窗口化）
+        self._anno_items_map = {}   # 页号 -> 该页批注图元（窗口化）
+        self._page_render_sig = {}  # 页号 -> 当前已渲染内容的签名（判断是否需要重渲）
+        # 滚动条变化 → 更新当前页 + 窗口化渲染（拖动滚动条即"整篇翻阅"）
+        # 渲染经 0ms 定时器推迟到事件循环，避免在滚动回调里增删图元
+        self._win_timer = QTimer(self)
+        self._win_timer.setSingleShot(True)
+        self._win_timer.setInterval(0)
+        self._win_timer.timeout.connect(self._apply_scroll_state)
+        self.view.verticalScrollBar().valueChanged.connect(self._on_view_scrolled)
+        # 快速缩放结束后重渲染清晰版（缩放期间用的是低分辨率预览）
+        self._zoom_refine_timer = QTimer(self)
+        self._zoom_refine_timer.setSingleShot(True)
+        self._zoom_refine_timer.setInterval(ZOOM_REFINE_MS)
+        self._zoom_refine_timer.timeout.connect(self._refine_zoom_render)
         self.md_panel = MdPanel(self)   # Markdown 阅读面板（与画布堆栈切换）
         self.md_path = ""               # 当前打开的 MD 文件（空=未打开）
         self._view_mode = "pdf"         # "pdf" 或 "md"
@@ -2711,6 +3395,26 @@ class MainWindow(QMainWindow):
         # 美化绘制（图标/导引线/配色）；page_no 用于标记"当前页"书签
         self.toc_tree.setItemDelegate(TocDelegate(self))
 
+        # ---- 左侧批注列表（总览 + 点击定位） ----
+        self.anno_list_ui = QWidget()
+        alv = QVBoxLayout(self.anno_list_ui)
+        alv.setContentsMargins(0, 0, 0, 0)
+        alv.setSpacing(0)
+        self.anno_list_hint = QLabel("  批注列表")
+        self.anno_list_hint.setStyleSheet(
+            "QLabel{background:#f3f3f3; color:#555; padding:6px 4px;"
+            " border-bottom:1px solid #e0e0e0; font-weight:bold;}")
+        alv.addWidget(self.anno_list_hint)
+        self.anno_list = QListWidget()
+        self.anno_list.setStyle(QStyleFactory.create("Fusion"))
+        self.anno_list.setStyleSheet(
+            "QListWidget{background:#ffffff; border:none; outline:none;}"
+            "QListWidget::item{padding:6px 8px; border-bottom:1px solid #f0f0f0;}"
+            "QListWidget::item:selected{background:#e3f2fd; color:#0d47a1;}")
+        self.anno_list.itemClicked.connect(self._on_anno_list_click)
+        self.anno_list.itemDoubleClicked.connect(self._on_anno_list_click)
+        alv.addWidget(self.anno_list, 1)
+
         # ---- 主布局：左侧活动栏 | splitter(左侧面板 + 内容区) ----
         # 笔记面板逻辑对象：UI 拆为 列表(并入左侧堆栈) + 编辑器(右侧停靠窗)
         self.note_panel = NotePanel(self)
@@ -2719,6 +3423,7 @@ class MainWindow(QMainWindow):
         self.left_stack.addWidget(self.tree)              # index 0: 文件夹
         self.left_stack.addWidget(self.toc_tree)          # index 1: 目录
         self.left_stack.addWidget(self.note_panel.list_ui)  # index 2: 笔记列表
+        self.left_stack.addWidget(self.anno_list_ui)      # index 3: 批注列表
         # 内容区堆栈：PDF 画布 / Markdown 阅读面板 / 笔记编辑器（无文档时全屏）
         self.content_stack = QStackedWidget()
         self.content_stack.addWidget(self.view)      # index 0: PDF 画布
@@ -2810,6 +3515,8 @@ class MainWindow(QMainWindow):
                                         checkable=True, checked=True)
         self.btn_toc = add_activity("☰", "目录（书签）面板", self.toggle_toc,
                                     checkable=True)
+        self.btn_anno_list = add_activity("🖍", "批注列表面板（总览+定位）",
+                                          self.toggle_anno_list, checkable=True)
         self.btn_notes = add_activity("📝", "笔记面板 (Ctrl+J)",
                                       self.toggle_notes, checkable=True)
         add_activity("🔍", "搜索 (Ctrl+F)", self.toggle_search)
@@ -2858,6 +3565,12 @@ class MainWindow(QMainWindow):
         self.search_hit_items = []   # 当前页命中高亮图元
         self.search_kw = ""
         self.pixmap = None
+        self._page_pix_cache = OrderedDict()   # (页号, 瓦片k, 瓦片j, 渲染档位) -> QPixmap
+        self._restored_progress = False
+        # 阅读进度落盘（防抖：翻页/缩放停止 500ms 后写一次）
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setSingleShot(True)
+        self._progress_timer.timeout.connect(self._save_progress)
         self._loading = False
 
         self.build_toolbar()
@@ -3057,7 +3770,8 @@ class MainWindow(QMainWindow):
         self.pdf_only_widgets.append(self.font_size)
         tb2.addSeparator()
 
-        add_text2("撤销", "撤销本页最后一条批注 (Ctrl+Z)", self.undo)
+        add_text2("撤销", "撤销最近的批注改动（可跨页，Ctrl+Z）", self.undo)
+        add_text2("重做", "重做被撤销的批注改动 (Ctrl+Y)", self.redo)
         add_text2("清除本页", "清除本页全部批注", self.clear_page)
 
     def build_shortcuts(self):
@@ -3077,6 +3791,7 @@ class MainWindow(QMainWindow):
             "zoom_in": lambda: self.step_zoom(1),
             "zoom_out": lambda: self.step_zoom(-1),
             "undo": self.undo,
+            "redo": self.redo,
             "copy": self.copy_selection,
             "highlight": self.highlight_selection,
             "delete_anno": self.delete_selected,
@@ -3098,7 +3813,8 @@ class MainWindow(QMainWindow):
         }
         # 打字时需要禁用的（会劫持按键或误触发）
         typing_keys = {
-            "prev_page", "next_page", "undo", "copy", "highlight", "delete_anno",
+            "prev_page", "next_page", "undo", "redo", "copy", "highlight",
+            "delete_anno",
             "toggle_folders", "switch_tool", "tool_view", "tool_selecttext",
             "tool_selanno", "tool_highlight", "tool_text", "tool_texthl",
             "translate",
@@ -3270,22 +3986,47 @@ class MainWindow(QMainWindow):
         if anchor is None:
             anchor = (vp.width() / 2, vp.height() / 2)
         vx, vy = anchor
-        # 本程序不用 view.scale()，场景坐标=视口坐标+滚动条值；
-        # pixmap 以 zoom(=user×RENDER_SCALE) 渲染，PDF内容点 = 场景坐标 / zoom
+        # 本程序不用 view.scale()，场景坐标 = 视口坐标 + 滚动条值。
+        # 求出鼠标下那一"页内点"，缩放后让它仍落在鼠标位置（锚点不动）。
         zs = self.zoom  # 缩放前场景系数
-        vsb0 = self.view.verticalScrollBar().value()
-        hsb0 = self.view.horizontalScrollBar().value()
-        # 鼠标处 PDF 内容点（页面内坐标，不含上页预览偏移）
-        pdf_x = (hsb0 + vx) / zs
-        pdf_y = (vsb0 + vy - self._prev_h) / zs
+        sb0 = self.view.verticalScrollBar().value()
+        hb0 = self.view.horizontalScrollBar().value()
+        scene_y = sb0 + vy
+        pno = self._page_at_scroll(scene_y)
+        _, ptop = self._page_origin(pno)
+        pleft = self._page_lefts[pno] if self._page_lefts else 0.0
+        dx_in = (hb0 + vx - pleft) / zs      # 页内偏移（PDF 坐标）
+        dy_in = (scene_y - ptop) / zs
         self._zoom_factor = new_z
+        # 连续缩放期间用低分辨率预览（像素量 1/4），跟手不卡；停手后补清晰版
+        self._zooming_fast = True
         self.load_page(keep_scroll=True)
-        # 缩放后：让同一 PDF 内容点落在鼠标视口位置
+        # 缩放后：同一页内点重新对准鼠标视口位置
         zs2 = self.zoom
-        vsb = self.view.verticalScrollBar()
-        hsb = self.view.horizontalScrollBar()
-        vsb.setValue(round(pdf_y * zs2 + self._prev_h - vy))
-        hsb.setValue(round(pdf_x * zs2 - vx))
+        _, ptop2 = self._page_origin(pno)
+        pleft2 = self._page_lefts[pno] if self._page_lefts else 0.0
+        self._set_scroll(round(ptop2 + dy_in * zs2 - vy))
+        self.view.horizontalScrollBar().setValue(
+            round(pleft2 + dx_in * zs2 - vx))
+        # _set_scroll 屏蔽了滚动信号（避免重入），但上面的 load_page 是按"旧滚动值
+        # + 新几何"渲染并算页号的，与最终位置不符 —— 表现为页码跳变、视口内的页
+        # 从未渲染（白屏）。这里按最终滚动位置补做窗口化渲染与页码同步。
+        self._render_window()
+        self._sync_page_from_scroll()
+        self._ensure_page_visible_x()
+        # 停手后重渲染清晰版（若期间又缩放，定时器会被重新起，只做最后一次）
+        self._zoom_refine_timer.start()
+
+    def _refine_zoom_render(self):
+        """缩放/翻页停止后：退出预览档，按 2~3 倍超采样重渲染，画面更锐利。
+        渲染签名含实际倍率，倍率变化后 _render_window 会重建受影响的页。"""
+        if not self._zooming_fast:
+            return
+        self._zooming_fast = False
+        self._zooming_refined = True
+        if not self.doc or not self._page_tops:
+            return
+        self._render_window()
 
     def fit_to_width(self):
         """计算适合画布的缩放比例，使整页完整显示（不出现滚动条）。
@@ -3315,7 +4056,7 @@ class MainWindow(QMainWindow):
     # 每个 PDF 会话需要独立保存的字段（工具/颜色/搜索面板为全局共享，不快照）
     SESSION_FIELDS = ("doc", "pdf_path", "page_no", "_zoom_factor", "annos",
                       "toc_items", "toc_dirty", "_toc_clip", "deleted_pages",
-                      "page_map", "_saved_sig")
+                      "page_map", "_saved_sig", "_undo_stack", "_redo_stack")
 
     def _capture_session(self):
         """把当前文档相关字段收集成一个会话字典（不修改现场）。"""
@@ -3341,14 +4082,19 @@ class MainWindow(QMainWindow):
         # 以下为"当前页渲染"临时态，恢复后由 load_page 重建，先清空
         self.sel_text = ""
         self.sel_hits = []
-        self._words_cache = {}
-        self._scene_page_rects = {}
+        self._words_cache = OrderedDict()   # 页号 -> 词表（按访问顺序有限保留）
+        self._clear_doc_geometry()
         self._text_editor = None
         self.drawing = False
         self.free_pts = []
         self.preview_items = []
         self.clear_hit_marks()
-        self.scene.clear()
+        self._page_pix_cache.clear()   # 换文档，渲染缓存失效
+        self._rendering = True         # 屏蔽清场景期间的滚动信号重入
+        try:
+            self.scene.clear()
+        finally:
+            self._rendering = False
 
     def _tab_index_of(self, path):
         for i in range(self.doc_tabs.count()):
@@ -3398,17 +4144,24 @@ class MainWindow(QMainWindow):
         self.doc = newdoc
         self.pdf_path = f
         self.annos = {}
-        self.page_no = 0
-        self._zoom_factor = 1.0
-        self._words_cache = {}   # 换文档：清空词表缓存
+        prog = progress_get(f)   # 上次阅读进度：页号 + 缩放
+        self.page_no = min(max(0, prog[0]), self.doc.page_count - 1) if prog else 0
+        self._zoom_factor = prog[1] if prog else 1.0
+        self._restored_progress = bool(prog)
+        self._undo_stack = []    # 新文档：清空撤销/重做
+        self._redo_stack = []
+        self._words_cache = OrderedDict()   # 换文档：清空词表缓存
+        self._page_pix_cache.clear()   # 换文档：清空页面渲染缓存
         self.toc_items = [list(t) for t in self.doc.get_toc(simple=True)]
         self.toc_dirty = False
         self._toc_clip = None
+        self._hier_index = None   # 换文档：层级索引作废（惰性重建）
+        self._alt_ready = False   # 换文档：Altium 链接缓存作废（惰性重建）
         self.deleted_pages = set()                       # 换文档：重置删页记录
         self.page_map = list(range(self.doc.page_count))  # 当前页索引 -> 原始页索引
         self.sel_text = ""
         self.sel_hits = []
-        self._scene_page_rects = {}
+        self._clear_doc_geometry()
         self._text_editor = None
         self._saved_sig = self._state_sig()   # 新打开的文档视为"已保存"状态
         self.sessions[f] = self._capture_session()
@@ -3427,13 +4180,20 @@ class MainWindow(QMainWindow):
         self.refresh_toc()  # 刷新左侧目录（书签）树
         # 延迟自动适应窗口宽度（等视口尺寸就绪）。
         # 绑定目标路径：若 50ms 内用户已切到别的标签，则不再改当前文档缩放
+        # 有历史阅读进度时保留上次缩放，不自动适应窗口
         def _delayed_fit(target=f):
-            if self.pdf_path == target and self.doc is not None:
+            if self.pdf_path == target and self.doc is not None \
+                    and not self._restored_progress:
                 self.fit_to_width()
         QTimer.singleShot(50, _delayed_fit)
         history_add(f)
-        self.statusBar().showMessage(
-            f"已打开: {os.path.basename(f)}（共 {self.doc.page_count} 页）")
+        if prog:
+            self.statusBar().showMessage(
+                f"已打开: {os.path.basename(f)}（共 {self.doc.page_count} 页，"
+                f"已回到第 {self.page_no + 1} 页）")
+        else:
+            self.statusBar().showMessage(
+                f"已打开: {os.path.basename(f)}（共 {self.doc.page_count} 页）")
         self.note_panel.on_pdf_changed(f)
         self._apply_view_mode("pdf")
 
@@ -3935,6 +4695,71 @@ class MainWindow(QMainWindow):
         if nid:
             self.note_panel.show_editor()
 
+    def toggle_anno_list(self):
+        """切换左侧批注列表面板；打开时刷新列表。"""
+        if self.left_stack.isVisible() and self.left_stack.currentIndex() == 3:
+            self._hide_left_panel(self.btn_anno_list)
+        else:
+            self._show_left_panel(3, self.btn_anno_list)
+            self.refresh_anno_list()
+
+    def _anno_kind_label(self, a):
+        """批注类型 -> 列表显示用标签与图标。"""
+        t = a.get("type")
+        return {"rect": "▭ 矩形", "oval": "◯ 椭圆", "line": "╱ 直线",
+                "arrow": "➚ 箭头", "pen": "✎ 画笔", "highlight": "🖍 荧光笔",
+                "texthl": "🖍 文字高亮", "text": "T 文字"}.get(t, "• 批注")
+
+    def refresh_anno_list(self):
+        """重建批注列表：汇总当前文档所有页的批注，按页码排序。"""
+        self.anno_list.clear()
+        if not self.doc:
+            self.anno_list_hint.setText("  批注列表（未打开文档）")
+            return
+        total = sum(len(v) for v in self.annos.values() if v)
+        self.anno_list_hint.setText(f"  批注列表（{total} 条）")
+        for pno in sorted(k for k, v in self.annos.items() if v):
+            for i, a in enumerate(self.annos[pno]):
+                if not a:
+                    continue
+                kind = self._anno_kind_label(a)
+                if a.get("type") == "text":
+                    preview = (a.get("text") or "").replace("\n", " ")[:24]
+                else:
+                    preview = ""
+                label = f"第 {pno + 1} 页 · {kind}"
+                if preview:
+                    label += f"　{preview}"
+                it = QListWidgetItem(label)
+                it.setData(Qt.UserRole, pno)
+                it.setData(Qt.UserRole + 1, i)
+                try:
+                    it.setForeground(QColor(a.get("color", "#333")))
+                except Exception:
+                    pass
+                if pno == self.page_no:
+                    f = it.font()
+                    f.setBold(True)
+                    it.setFont(f)
+                self.anno_list.addItem(it)
+        if self.anno_list.count() == 0:
+            it = QListWidgetItem("（当前文档还没有批注）")
+            it.setDisabled(True)
+            it.setData(Qt.UserRole, None)
+            self.anno_list.addItem(it)
+
+    def _on_anno_list_click(self, item):
+        """点击批注列表项：跳转到对应页。"""
+        if item is None:
+            return
+        pno = item.data(Qt.UserRole)
+        if pno is None or not self.doc:
+            return
+        if 0 <= pno < self.doc.page_count and pno != self.page_no:
+            self.page_no = pno
+            self.load_page()
+            self.statusBar().showMessage(f"已定位到第 {pno + 1} 页的批注")
+
     def _set_activity_checked(self, btn, on):
         """程序化设置活动栏按钮选中态。
         互斥按钮组只在'真实点击'时自动取消其他按钮，程序化 setChecked 不会，
@@ -4151,8 +4976,12 @@ class MainWindow(QMainWindow):
                 self.doc.delete_page(ci)
             self.annos.pop(ci, None)
             self.annos = {k - 1 if k > ci else k: v for k, v in self.annos.items()}
+        # 页号整体前移，历史栈中的页号失效：清空撤销/重做
+        self._undo_stack = []
+        self._redo_stack = []
         self._words_cache.clear()
-        self._scene_page_rects.clear()
+        self._clear_doc_geometry()
+        self._page_pix_cache.clear()   # 页内容已变，缓存失效
 
     def toc_copy(self, item):
         src = self._toc_index(item)
@@ -4207,6 +5036,318 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setImage(img)
         self.statusBar().showMessage(
             f"已将第 {pno + 1} 页整页图片复制到剪贴板（{pix.width}×{pix.height}）")
+
+    # ---------------- Altium 原理图层级导航（Descend / Ascend） ----------------
+    def _ensure_hier_index(self):
+        """惰性构建层级索引：书签变化（含用户编辑/切换文档）时自动重建。"""
+        sig = (id(self.doc), len(self.toc_items))
+        if self._hier_index is not None and self._hier_sig == sig:
+            return
+        self._hier_index = self._build_hier_index()
+        self._hier_sig = sig
+
+    def _build_hier_index(self):
+        """解析 Altium 层级书签，返回 [(name_lower, parent_pno, inst,
+        first_child, last_child)]（页号均 0 基）。
+
+        关键：书签里的 <pageN> 是 **Altium 图纸名**，不是页码。顶层图纸偶然
+        按顺序命名，所以顶层条目的 N 看着像页码；一旦嵌套就对不上——例如
+        controller_vr14_4a4phase_bhs_compress<page2_i11>(109) 里的 "page2"
+        图纸实际在 PDF 第 108 页。真实父页取自**书签树里最近的上级图纸**
+        （lvl>=2 的最近祖先）所在页；顶层条目没有这种祖先，此时 N 恰好等于
+        页码，直接用 N。"""
+        toc = self.toc_items
+        n = self.doc.page_count
+        out = []
+        for i, (lvl, title, _pno) in enumerate(toc):
+            m = HIER_TITLE_RE.match((title or "").strip())
+            if not m:
+                continue
+            rng = self._page_range(m.group("pages"))
+            if rng is None:
+                continue
+            first, last = rng
+            if not (0 <= first < n):
+                continue
+            parent = self._hier_parent_page(toc, i, first)
+            if parent is None or not (0 <= parent < n):
+                continue
+            out.append((m.group("name").strip().lower(), parent,
+                        m.group("inst"), first, min(last, n - 1)))
+        return out
+
+    @staticmethod
+    def _page_range(s):
+        """'121' -> (120,120)；'110-111' -> (109,110)；无效返回 None（均 0 基）。"""
+        if not s:
+            return None
+        s = s.strip()
+        if "-" in s:
+            a, b = s.split("-", 1)
+            if a.strip().isdigit() and b.strip().isdigit():
+                return int(a) - 1, int(b) - 1
+            return None
+        return (int(s) - 1, int(s) - 1) if s.isdigit() else None
+
+    def _hier_parent_page(self, toc, idx, child_first):
+        """层级条目 idx 的父图纸所在页（0 基）。
+
+        书签树本身就是 Altium 的图纸层级：往上找第一个 lvl 更小的条目即
+        最近祖先；若该祖先是图纸（lvl>=2）且排在子图之前，取它所在页。
+        走到根节点（lvl1）仍没有图纸祖先时，退回用 N（顶层图纸名的 N 即页码）。"""
+        cur = toc[idx][0]
+        j = idx - 1
+        while j >= 0:
+            lj = toc[j][0]
+            if lj < cur:
+                if lj >= 2:
+                    p = toc[j][2] - 1
+                    if 0 <= p < child_first:
+                        return p
+                cur = lj
+            j -= 1
+        m = HIER_TITLE_RE.match((toc[idx][1] or "").strip())
+        return int(m.group("parent")) - 1 if m else None
+
+    def hier_children(self, pno, name=None):
+        """某页的子图条目 [(name, first_child, last_child, inst)]，按子图页排序。
+        优先用 Altium 原生链接（精确到块），无链接时退回书签推断。"""
+        by_page, _ = self._alt_links()
+        ents = [e for e, _r in by_page.get(pno, [])]
+        if not ents:
+            self._ensure_hier_index()
+            ents = [(nm, first, last, inst)
+                    for nm, par, inst, first, last in self._hier_index
+                    if par == pno]
+        if name is not None:
+            ents = [e for e in ents if e[0] == name]
+        return sorted(ents, key=lambda t: t[1])
+
+    # ---- Altium 原生 Descend 链接（首选，精确到每个 sheet 块） ----
+    def _alt_links(self):
+        """解析 PDF 内嵌的 Altium Descend 链接，返回 (by_page, parent_of)。
+
+        Altium 导出 PDF 时会给每个 sheet 块放一个 Link 注释，其 /A 指向内嵌
+        JS（就是 Altium 里右键弹出的那个 Descend 菜单）：
+            var name="Instance I4 of PWR_EFUSE_MP5991_12VIN_20A_COMPRESS";
+            var dst="@LIB.SHEET(SCH_1):PAGE12135_I4@LIB.PWR_EFUSE_..._COMPRESS(SCH_1)";
+            MyFunc(name, attr, lst, "Descend", dst);
+        /Rect 就是该块的点击范围，dst 是命名目标键、可直接查到真实页号。
+        这是官方数据：同页多个同名块各有自己的 Rect，能精确区分点的是哪一个。
+        解析一次后缓存（仅在换文档时重做）。"""
+        if self._alt_ready and self._alt_sig == id(self.doc) \
+                and self._alt_doc is self.doc:
+            return self._alt_map, self._alt_parent
+        self._alt_doc = self.doc
+        by_page, parent_of = {}, {}
+        doc = self.doc
+        if doc is not None:
+            try:
+                names = doc.resolve_names()
+            except Exception:
+                names = {}
+            for pno in range(doc.page_count):
+                try:
+                    axrefs = list(doc[pno].annot_xrefs())
+                except Exception:
+                    continue
+                for a in axrefs:
+                    xr = a[0] if isinstance(a, (tuple, list)) else a
+                    try:
+                        obj = doc.xref_object(int(xr), compressed=True)
+                    except Exception:
+                        continue
+                    if not obj or "/Subtype/Link" not in obj.replace(" ", ""):
+                        continue
+                    ma = ALT_ACTION_RE.search(obj)
+                    mr = ALT_RECT_RE.search(obj)
+                    if not (ma and mr):
+                        continue
+                    try:
+                        act = doc.xref_object(int(ma.group(1)), compressed=True)
+                    except Exception:
+                        continue
+                    if "Descend" not in (act or ""):
+                        continue
+                    mname = ALT_NAME_RE.search(act)
+                    mdst = ALT_DST_RE.search(act)
+                    if not (mname and mdst):
+                        continue
+                    info = names.get(mdst.group(1).replace("\\", ""))
+                    if not info or info.get("page") is None:
+                        continue
+                    target = info["page"]
+                    if not (0 <= target < doc.page_count):
+                        continue
+                    mi = ALT_INSTANCE_RE.match(mname.group(1))
+                    inst = mi.group(1) if mi else ""
+                    sheet = (mi.group(2) if mi else "").lower()
+                    # 注释里的 /Rect 用 PDF 原始坐标（左下原点），须换算成
+                    # pymupdf 的左上原点：fitz_y = 页高 - pdf_y。
+                    ph = doc[pno].rect.height
+                    x0, y0, x1, y1 = (float(mr.group(i)) for i in range(1, 5))
+                    rect = pymupdf.Rect(min(x0, x1), ph - max(y0, y1),
+                                        max(x0, x1), ph - min(y0, y1))
+                    by_page.setdefault(pno, []).append(
+                        ((sheet, target, target, inst), rect))
+                    parent_of.setdefault(target, pno)
+        self._alt_map, self._alt_parent = by_page, parent_of
+        self._alt_sig, self._alt_ready = id(doc), True
+        return by_page, parent_of
+
+    def _hier_boxes_for(self, pno):
+        """某页的 [(条目, 点击矩形)]（PDF 坐标）——直接来自 Altium 原生链接。"""
+        by_page, _ = self._alt_links()
+        return by_page.get(pno, [])
+
+    def _hier_entry_at(self, sp):
+        """点击处(场景坐标)对应的层级条目；无法确定时 None。
+        首选 Altium 原生链接的矩形（精确到块，同名块也能区分）；该页无链接时
+        退化为按名称文字匹配——且仅当该名称只对应唯一子图时才采用，否则返回
+        None，交给调用方列出候选（避免猜错块跳到错误页）。"""
+        by_page, _ = self._alt_links()
+        for pno in sorted(self._scene_page_rects):
+            pr = self._scene_page_rects[pno]
+            if not pr.contains(sp):
+                continue
+            entries = by_page.get(pno)
+            if not entries:
+                continue
+            px = (sp.x() - pr.left()) / self.zoom
+            py = (sp.y() - pr.top()) / self.zoom
+            pt = pymupdf.Point(px, py)
+            for ent, rect in entries:
+                if rect.contains(pt):
+                    return ent
+        name = self._hier_name_at(sp)
+        if not name:
+            return None
+        pno = self._page_at_scroll(sp.y())
+        kids = self.hier_children(pno, name)
+        return kids[0] if len(kids) == 1 else None
+
+    def _hier_name_at(self, sp):
+        """点击处(场景坐标)命中的书签子图名；没有则 None。
+        逐页把场景坐标换算成 PDF 坐标，取覆盖该点的词，再与层级索引里的
+        名字比对（大小写无关、允许名称被拆词时的前缀匹配）。"""
+        for pno in sorted(self._scene_page_rects):
+            pr = self._scene_page_rects[pno]
+            if not pr.contains(sp):
+                continue
+            px, py = (sp.x() - pr.left()) / self.zoom, (sp.y() - pr.top()) / self.zoom
+            children = {nm for nm, _f, _l, _i in self.hier_children(pno)}
+            if not children:
+                continue
+            best = None
+            for w in self.get_words(pno):
+                x0, y0, x1, y1, t = w[:5]
+                if not (x0 - 1 <= px <= x1 + 1 and y0 - 1 <= py <= y1 + 1):
+                    continue
+                tl = t.strip().lower()
+                # 完整名命中优先；其次名称被拆成多词时取最长前缀词
+                if tl in children:
+                    return tl
+                if len(tl) >= 6:
+                    for nm in children:
+                        if nm.startswith(tl) and (best is None or len(tl) > len(best)):
+                            best = tl
+                break
+            return best
+        return None
+
+    def build_hier_menu(self, sp):
+        """构造层级右键菜单；无层级信息时返回 None（不影响普通 PDF）。"""
+        if not self.doc:
+            return None
+        by_page, _ = self._alt_links()
+        self._ensure_hier_index()
+        if not by_page and not self._hier_index:
+            return None         # 既无 Altium 链接也无层级书签：普通 PDF
+        pno = self._page_at_scroll(sp.y())
+        menu = QMenu(self.view)
+
+        # ---- Descend：进入子图 ----
+        # 优先用 Altium 原生链接的精确矩形（同名块也能区分点的是哪一个）
+        hit = self._hier_entry_at(sp)
+        if hit is not None:
+            nm, first, last, inst = hit
+            a = menu.addAction(
+                f"⬇ Descend 进入子图：{nm}（{self._page_span(first, last)}）")
+            a.triggered.connect(lambda _=False, c=first: self._hier_jump(c))
+            allkids = self.hier_children(pno)
+            if len(allkids) > 1:
+                # 同页还有别的块：一并列出，便于跨块跳转
+                sub = menu.addMenu(f"本页其他子图（{len(allkids) - 1} 个）")
+                for onm, ofirst, olast, oinst in allkids:
+                    if (onm, ofirst) == (nm, first):
+                        continue
+                    x = sub.addAction(
+                        f"{self._page_span(ofirst, olast)}  （{oinst}）")
+                    x.triggered.connect(lambda _=False, c=ofirst: self._hier_jump(c))
+        else:
+            name = self._hier_name_at(sp)
+            kids = self.hier_children(pno, name) if name else []
+            if kids:
+                if len(kids) == 1:
+                    nm, first, last, _inst = kids[0]
+                    a = menu.addAction(
+                        f"⬇ Descend 进入子图：{nm}（{self._page_span(first, last)}）")
+                    a.triggered.connect(lambda _=False, c=first: self._hier_jump(c))
+                else:
+                    # 同页多个同名 sheet，但丝印未能配对（PDF 无实例标记）：
+                    # 无法自动分辨点击的是哪一个，列出全部候选让用户选。
+                    sub = menu.addMenu(f"⬇ Descend 进入子图（{len(kids)} 个同名）")
+                    for _nm, first, last, inst in kids:
+                        a = sub.addAction(
+                            f"{self._page_span(first, last)}  （{inst}）")
+                        a.triggered.connect(lambda _=False, c=first: self._hier_jump(c))
+            elif name:
+                menu.addAction(f"（“{name}”没有对应的子图页）").setEnabled(False)
+            else:
+                # 点在空白处：列出本页全部子图，供手动选择
+                allkids = self.hier_children(pno)
+                if allkids:
+                    sub = menu.addMenu(f"⬇ Descend 本页子图（{len(allkids)} 个）")
+                    for nm, first, last, _inst in allkids:
+                        a = sub.addAction(
+                            f"{nm[:40]}  →  {self._page_span(first, last)}")
+                        a.triggered.connect(lambda _=False, c=first: self._hier_jump(c))
+
+        # ---- Ascend：当前页若是由某个父页下钻而来，提供返回 ----
+        parent = self.hier_parent_of(pno)
+        if parent is not None:
+            if not menu.isEmpty():
+                menu.addSeparator()
+            a = menu.addAction(f"⬆ Ascend 返回上级（第 {parent + 1} 页）")
+            a.triggered.connect(lambda _=False, p=parent: self._hier_jump(p))
+        # 既无子图也无上级：不弹空菜单
+        return menu if not menu.isEmpty() else None
+
+    @staticmethod
+    def _page_span(first, last):
+        """页范围文字：单页 '第 121 页'；多页 '第 110-111 页'（入参 0 基）。"""
+        if first == last:
+            return f"第 {first + 1} 页"
+        return f"第 {first + 1}-{last + 1} 页"
+
+    def hier_parent_of(self, pno):
+        """子图页 → 它所在的父页；没有则 None。多父时取第一个。
+        优先用 Altium 原生链接的父子关系（精确），退回书签推断。"""
+        _, parent_of = self._alt_links()
+        if pno in parent_of:
+            return parent_of[pno]
+        self._ensure_hier_index()
+        for _nm, par, _inst, first, last in self._hier_index:
+            if first <= pno <= last:
+                return par
+        return None
+
+    def _hier_jump(self, pno):
+        """跳转到指定页（层级导航用）。"""
+        if not self.doc or not (0 <= pno < self.doc.page_count):
+            return
+        self.page_no = pno
+        self.load_page()
 
     def on_toc_click(self, item, col=0):
         """点击目录条目跳转到对应页；点击根节点则展开/收起。"""
@@ -4385,6 +5526,8 @@ class MainWindow(QMainWindow):
         self.pdf_path = ""
         self.page_no = 0
         self.annos = {}
+        self._undo_stack = []
+        self._redo_stack = []
         self.toc_items = []
         self.toc_dirty = False
         self._toc_clip = None
@@ -4394,14 +5537,19 @@ class MainWindow(QMainWindow):
         self._zoom_factor = 1.0
         self.sel_text = ""
         self.sel_hits = []
-        self._words_cache = {}
-        self._scene_page_rects = {}
+        self._words_cache = OrderedDict()   # 页号 -> 词表（按访问顺序有限保留）
+        self._clear_doc_geometry()
         self._text_editor = None
         self.search_kw = ""
         self.search_results = []
         self.search_idx = -1
         self.clear_hit_marks()
-        self.scene.clear()
+        self._page_pix_cache.clear()   # 无文档，清空渲染缓存
+        self._rendering = True         # 屏蔽清场景期间的滚动信号重入
+        try:
+            self.scene.clear()
+        finally:
+            self._rendering = False
         self.page_spin.setRange(1, 1)
         self.page_spin.setValue(1)
         self.page_label.setText("")
@@ -4607,7 +5755,8 @@ class MainWindow(QMainWindow):
             # _focus_rect 只标了当前一处；重画本页全部命中（当前=橙，其余=黄）
             self.render_page_hits()
         else:
-            self.view.verticalScrollBar().setValue(0)
+            self._set_scroll(self._page_tops[self.page_no] if
+                             self.page_no < len(self._page_tops) else 0)
         # 同步列表选中态
         for i in range(self.search_list.count()):
             if self.search_list.item(i).data(Qt.UserRole) == idx:
@@ -4630,13 +5779,15 @@ class MainWindow(QMainWindow):
 
     def _focus_rect(self, rect_pdf):
         z = self.zoom
-        cx = (rect_pdf[0] + rect_pdf[2]) / 2 * z
-        cy = (rect_pdf[1] + rect_pdf[3]) / 2 * z
+        # 命中所在页（跨文件跳转后以 rec 页为准，这里用当前页）
+        ox, oy = self._page_origin(self.page_no)
+        cx = ox + (rect_pdf[0] + rect_pdf[2]) / 2 * z
+        cy = oy + (rect_pdf[1] + rect_pdf[3]) / 2 * z
         # 让命中点居中
         self.view.centerOn(QPointF(cx, cy))
         # 高亮命中矩形（橙色描边+深黄底，区别于其他命中的黄色）
         self.clear_hit_marks()
-        r = QRectF(rect_pdf[0] * z, rect_pdf[1] * z,
+        r = QRectF(ox + rect_pdf[0] * z, oy + rect_pdf[1] * z,
                    (rect_pdf[2] - rect_pdf[0]) * z,
                    (rect_pdf[3] - rect_pdf[1]) * z)
         fill = QGraphicsRectItem(r)
@@ -4661,13 +5812,15 @@ class MainWindow(QMainWindow):
         if not self.search_kw or not self.doc:
             return
         z = self.zoom
+        ox, oy = self._page_origin(self.page_no)
         cur = self.search_results[self.search_idx] if \
             (0 <= self.search_idx < len(self.search_results)) else None
         for i, rec in enumerate(self.search_results):
             if (rec["file"] == self.pdf_path and rec["page"] == self.page_no
                     and rec.get("rect")):
                 x0, y0, x1, y1 = rec["rect"]
-                r = QRectF(x0 * z, y0 * z, (x1 - x0) * z, (y1 - y0) * z)
+                r = QRectF(ox + x0 * z, oy + y0 * z,
+                           (x1 - x0) * z, (y1 - y0) * z)
                 fill = QGraphicsRectItem(r)
                 if rec is cur:
                     fill.setBrush(QColor(255, 152, 0, 130))   # 当前命中：橙色
@@ -4686,7 +5839,7 @@ class MainWindow(QMainWindow):
         np = self.page_no + d
         if 0 <= np < self.doc.page_count:
             self.page_no = np
-            # 往回翻默认落页底衔接连续滚动；land=滚轮无缝翻页的精确落点
+            # 往回翻默认落页底衔接连续滚动；land=精确落点（页内偏移）
             self.load_page(scroll_bottom=(d < 0 and land is None), land=land)
             return True
         return False
@@ -4698,22 +5851,351 @@ class MainWindow(QMainWindow):
             self.page_no = v - 1
             self.load_page()
 
-    def load_page(self, scroll_bottom=False, keep_scroll=False, land=None):
-        self.commit_text_editor()  # 翻页/缩放前提交内联文字（防图元悬挂到错误页）
-        if not self.doc:
-            return
-        page = self.doc[self.page_no]
-        z = self.zoom  # 已含 RENDER_SCALE，直接高分辨率渲染不降采样
-        # 高DPI屏（如150%缩放）：场景按逻辑像素布局，pixmap 按 物理分辨率 渲染
-        # （×dpr），贴图时 setDevicePixelRatio(dpr) → 物理像素1:1显示，零拉伸不糊
-        dpr = self.view.devicePixelRatioF()
-        rz = z * dpr
-        pix = page.get_pixmap(matrix=pymupdf.Matrix(rz, rz), alpha=False)
+    def _quantized_render_scale(self, rz, dpr):
+        """决定渲染倍率。
+
+        稳态（未在连续缩放）直接用精确 rz —— 它正好等于"1 场景单位 = dpr 物理
+        像素"的屏幕原生分辨率，即 1:1：图元不需任何缩放重采样，最清晰也最快。
+        缩放进行中则把倍率上取到 1.25 的幂（复用同一批缓存，多步缩放只渲一次，
+        跟手不卡）；停手 260ms 后由 _refine_zoom_render 重渲为精确 1:1。"""
+        if not self._zooming_fast:
+            return max(0.02, rz)
+        base = RENDER_SCALE * dpr
+        u = rz / base if base > 0 else 1.0
+        if u > 0:
+            k = math.ceil(math.log(u) / math.log(ZOOM_RENDER_STEP) - 1e-9)
+            u = ZOOM_RENDER_STEP ** max(0, k)
+        return max(0.02, u * base)
+
+    def _page_pix_needed(self, pno, rz_eff):
+        """整页按 rz_eff 渲染所需的像素尺寸 (w, h)。"""
+        r = self.doc[pno].rect
+        return r.width * rz_eff, r.height * rz_eff
+
+    def _use_full_page_render(self, pno, rz_eff):
+        """整页渲染是否在预算内。超出则改为只渲染视口可见区域 —— 后者像素量与
+        屏幕大小同级（与缩放无关），因此超宽原理图放到 400% 也保持 1:1 清晰，
+        而不会像"整页降倍渲染"那样变糊，也不会因分配失败而白屏。"""
+        w, h = self._page_pix_needed(pno, rz_eff)
+        return w * h <= PAGE_PIX_BUDGET and max(w, h) <= MAX_PIX_DIM
+
+    def _get_page_pixmap(self, pno, rz_eff, dpr):
+        """整页渲染（用于像素预算内的常规页面）：缓存键含页号与档位。"""
+        key = (pno, "page", round(rz_eff, 4))
+        pm = self._page_pix_cache.get(key)
+        if pm is not None:
+            self._page_pix_cache.move_to_end(key)
+            return pm
+        page = self.doc[pno]
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(rz_eff, rz_eff), alpha=False)
+        pm = self._to_pixmap(pix, dpr)
+        self._page_pix_cache[key] = pm
+        self._trim_pix_cache()
+        return pm
+
+    def _get_region_pixmap(self, pno, k0, j0, k1, j1, rz_eff, dpr):
+        """只渲染页面上一块区域（场景坐标按 REGION_GRID 对齐后换算成 PDF 坐标）。
+
+        区域起点严格等于 k0/j0 对齐值（不会被裁掉），故调用方可用
+        pos=(页左+k0*GRID, 页顶+j0*GRID)、scale=rz/rz_eff 精确定位。"""
+        key = (pno, "reg", k0, j0, k1, j1, round(rz_eff, 4))
+        pm = self._page_pix_cache.get(key)
+        if pm is not None:
+            self._page_pix_cache.move_to_end(key)
+            return pm
+        page = self.doc[pno]
+        z = self.zoom
+        x0, y0 = k0 * REGION_GRID / z, j0 * REGION_GRID / z
+        x1, y1 = k1 * REGION_GRID / z, j1 * REGION_GRID / z
+        clip = pymupdf.Rect(x0, y0, x1, y1) & page.rect   # 只截右下超出部分
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(rz_eff, rz_eff), clip=clip,
+                              alpha=False)
+        pm = self._to_pixmap(pix, dpr)
+        self._page_pix_cache[key] = pm
+        self._trim_pix_cache()
+        return pm
+
+    @staticmethod
+    def _to_pixmap(pix, dpr):
         img = QImage(pix.samples, pix.width, pix.height, pix.width * 3,
                      QImage.Format_RGB888).copy()
         pm = QPixmap.fromImage(img)
         pm.setDevicePixelRatio(dpr)
-        self.pixmap = pm
+        return pm
+
+    def _trim_pix_cache(self):
+        """按条数与总像素预算双重裁剪渲染缓存。"""
+        while len(self._page_pix_cache) > REGION_CACHE_MAX:
+            self._page_pix_cache.popitem(last=False)
+        total = 0
+        for pm in self._page_pix_cache.values():
+            total += pm.width() * pm.height()
+        while total > REGION_PIX_BUDGET and len(self._page_pix_cache) > 1:
+            _, pm = self._page_pix_cache.popitem(last=False)
+            total -= pm.width() * pm.height()
+
+    def _rebuild_doc_geometry(self):
+        """按当前缩放重建"整篇文档"的场景几何：每页左上角 y 与页面尺寸。
+        场景是一个连续的纵向长条（页与页之间留 PAGE_GAP），滚动条因此可以
+        一路拖到第 1 页顶部与最后一页底部。各页横向居中于最宽页。"""
+        z = self.zoom
+        widths, heights = [], []
+        for i in range(self.doc.page_count):
+            r = self.doc[i].rect
+            widths.append(r.width * z)
+            heights.append(r.height * z)
+        wmax = max(widths) if widths else 1.0
+        self._page_tops = []
+        self._page_sizes = []
+        y = 0.0
+        for i, (pw, ph) in enumerate(zip(widths, heights)):
+            self._page_tops.append(y)
+            self._page_sizes.append((pw, ph))
+            y += ph + PAGE_GAP
+        n = self.doc.page_count
+        self._doc_scene_h = max(1.0, y - PAGE_GAP) if n else 1.0
+        self._doc_scene_w = max(1.0, wmax)
+        self._page_lefts = [(wmax - pw) / 2.0 for pw in widths]
+        self._scene_page_rects = {
+            i: QRectF(self._page_lefts[i], self._page_tops[i],
+                      self._page_sizes[i][0], self._page_sizes[i][1])
+            for i in range(n)}
+
+    def _clear_doc_geometry(self):
+        """清空整篇文档几何与窗口化渲染记录（换文档/关文档时调用）。"""
+        self._scene_page_rects = {}
+        self._page_tops = []
+        self._page_lefts = []
+        self._page_sizes = []
+        self._doc_scene_h = 0.0
+        self._doc_scene_w = 0.0
+        self._page_pix_items = {}
+        self._anno_items_map = {}
+        self._page_render_sig = {}
+
+    def _page_origin(self, pno=None):
+        """某页左上角在场景中的坐标（缺省当前页）。"""
+        if pno is None:
+            pno = self.page_no
+        if 0 <= pno < len(self._page_tops):
+            return self._page_lefts[pno], self._page_tops[pno]
+        return 0.0, 0.0
+
+    def _page_at_scroll(self, val):
+        """场景 y=val 处对应的页号（用于滚动条位置 → 当前页）。"""
+        tops = self._page_tops
+        if not tops:
+            return 0
+        for i in range(len(tops) - 1, -1, -1):
+            if val >= tops[i] - 1:
+                return i
+        return 0
+
+    def _set_scroll(self, val):
+        """设置竖直滚动位置，且不触发"滚动→切页"联动。"""
+        sb = self.view.verticalScrollBar()
+        self._sync_scroll = True
+        try:
+            sb.setValue(int(max(sb.minimum(), min(val, sb.maximum()))))
+        finally:
+            self._sync_scroll = False
+
+    def _ensure_page_visible_x(self):
+        """确保当前页在视口内横向可见：若被横向滚动推到视口之外，则把该页
+        横向居中。修复"上一页是超宽原理图并横拖到最右，切到窄页后画面空白"
+        （窄页左右居中、左偏移大，残留的横向滚动位置把它留在视口左侧之外）。"""
+        if not self._page_tops or not (0 <= self.page_no < len(self._page_tops)):
+            return
+        hb = self.view.horizontalScrollBar()
+        vp = self.view.viewport()
+        left = self._page_lefts[self.page_no]
+        w = self._page_sizes[self.page_no][0]
+        h0 = hb.value()
+        if left + w < h0 or left > h0 + vp.width():
+            hb.setValue(int(max(hb.minimum(),
+                                min(left - (vp.width() - w) / 2.0, hb.maximum()))))
+
+    def _render_window(self):
+        """窗口化渲染：只保留视口附近的页（上下各多留一屏），其余页图元移除以省内存。"""
+        if self._rendering or not self.doc or not self._page_tops:
+            return
+        self._rendering = True
+        try:
+            self._render_window_inner()
+        finally:
+            self._rendering = False
+
+    def _render_plan(self, pno, rz, dpr, vw, vh, sbv, hbv):
+        """统一决定某页"怎么渲染"，返回 (mode, rz_eff, grids)，并据此生成签名。
+
+        mode="full"：整页一张图（rz_eff 受整页像素预算约束）
+        mode="reg" ：只渲染视口覆盖区域（rz_eff 受单次区域像素上限约束）
+        两个上限都保证 QPixmap 不会超过显卡纹理上限 → 不白屏。"""
+        rz_eff = self._quantized_render_scale(rz, dpr)
+        if self._use_full_page_render(pno, rz_eff):
+            # 整页：不叠超采样（纹理随缩放平方膨胀，叠了会卡）
+            return "full", rz_eff, None
+        # 区域渲染：像素量只与屏幕大小同级，可安全叠加 2 倍超采样（更锐利）
+        if not self._zooming_fast:
+            rz_eff *= REFINE_OVERSAMPLE
+        k0, j0, k1, j1 = self._region_grids(pno, vw, vh, sbv, hbv)
+        # 区域像素上限：单边不超过纹理上限，总像素不超过预算
+        z = self.zoom
+        g = REGION_GRID
+        reg_w_pdf = (k1 - k0) * g / z if z else 1.0
+        reg_h_pdf = (j1 - j0) * g / z if z else 1.0
+        if reg_w_pdf > 0 and reg_h_pdf > 0:
+            by_area = math.sqrt(REGION_MAX_PIXELS / (reg_w_pdf * reg_h_pdf))
+            by_dim = MAX_PIX_DIM / max(reg_w_pdf, reg_h_pdf)
+            cap = min(by_area, by_dim)
+            if rz_eff > cap:
+                rz_eff = max(0.02, cap)
+        return "reg", rz_eff, (k0, j0, k1, j1)
+
+    def _render_window_inner(self):
+        dpr = self.view.devicePixelRatioF()
+        rz = self.zoom * dpr
+        sb = self.view.verticalScrollBar()
+        hb = self.view.horizontalScrollBar()
+        vp = self.view.viewport()
+        vh, vw = vp.height(), vp.width()
+        lo = sb.value() - vh
+        hi = sb.value() + vh * 2
+        want = set()
+        for i, r in enumerate(self._scene_page_rects.values()):
+            if r.bottom() >= lo and r.top() <= hi:
+                want.add(i)
+        for pno in list(self._page_pix_items):
+            if pno not in want:
+                self._drop_page_items(pno)
+        for pno in sorted(want):
+            mode, rz_eff, grids = self._render_plan(
+                pno, rz, dpr, vw, vh, sb.value(), hb.value())
+            new_sig = (mode, round(rz_eff, 4)) if mode == "full" else \
+                      (mode, round(rz_eff, 4)) + tuple(grids)
+            if pno in self._page_pix_items and \
+                    self._page_render_sig.get(pno) == new_sig:
+                continue          # 已按同一档位/区域渲染过，无需重建
+            if pno in self._page_pix_items:
+                self._drop_page_items(pno)   # 档位或可见区域变了：重渲该页
+            self._render_one_page(pno, rz, rz_eff, dpr, mode, grids, new_sig)
+
+    def _region_grids(self, pno, vw, vh, sbv, hbv):
+        """当前视口在该页内覆盖的区域，按 REGION_GRID 向外对齐后的格坐标。"""
+        pl, pt = self._page_origin(pno)
+        pw, ph = self._page_sizes[pno]
+        x0 = max(0.0, min(hbv - pl, pw))
+        x1 = max(0.0, min(hbv + vw - pl, pw))
+        y0 = max(0.0, min(sbv - pt, ph))
+        y1 = max(0.0, min(sbv + vh - pt, ph))
+        g = REGION_GRID
+        # 向外各留一格：小幅滚动时区域不变，免去反复重渲
+        k0 = max(0, int(math.floor(x0 / g)) - 1)
+        j0 = max(0, int(math.floor(y0 / g)) - 1)
+        k1 = min(int(math.ceil(pw / g)), int(math.ceil(x1 / g)) + 1)
+        j1 = min(int(math.ceil(ph / g)), int(math.ceil(y1 / g)) + 1)
+        return k0, j0, k1, j1
+
+    def _drop_page_items(self, pno):
+        """移除某页的页面图元与批注图元（窗口化/重渲前调用）。"""
+        for it in self._page_pix_items.pop(pno, []):
+            if it.scene() is not None:
+                self.scene.removeItem(it)
+        for it in self._anno_items_map.pop(pno, []):
+            if it.scene() is not None:
+                self.scene.removeItem(it)
+        self._page_render_sig.pop(pno, None)
+
+    def _render_one_page(self, pno, rz, rz_eff, dpr, mode, grids, sig):
+        """渲染单页：预算内整页渲染；超宽/超高页只渲染视口可见区域。
+        rz_eff 含稳态超采样倍数，故按 rz/rz_eff 缩小回场景尺寸（超采样=更清晰）。"""
+        pl, pt = self._page_origin(pno)
+        pw, ph = self._page_sizes[pno]
+        ratio = rz / rz_eff if rz_eff else 1.0
+        items = []
+        pit = QGraphicsPixmapItem()
+        if mode == "full":
+            pit.setPixmap(self._get_page_pixmap(pno, rz_eff, dpr))
+            pit.setPos(pl, pt)
+        else:
+            k0, j0, k1, j1 = grids
+            pm = self._get_region_pixmap(pno, k0, j0, k1, j1, rz_eff, dpr)
+            pit.setPixmap(pm)
+            pit.setPos(pl + k0 * REGION_GRID, pt + j0 * REGION_GRID)
+        pit.setScale(ratio)   # 档位高于当前缩放时按比例缩小回正确尺寸
+        # 平滑缩小（默认最近邻会让缩小时的细线丢像素发糊、且每帧重采样更卡）；
+        # 档位最多比当前缩放高 1.25 倍，缩小幅度很小，平滑开销可忽略。
+        pit.setTransformationMode(Qt.SmoothTransformation)
+        pit.setZValue(0)
+        pit.setAcceptedMouseButtons(Qt.NoButton)   # 点击穿透到批注层
+        self.scene.addItem(pit)
+        items.append(pit)
+        b = QGraphicsRectItem(QRectF(pl - 0.5, pt - 0.5, pw + 1, ph + 1))
+        b.setBrush(QBrush(Qt.NoBrush))
+        b.setPen(QPen(QColor("#c0c0c0"), 1))
+        b.setZValue(1)    # 压在页面之上，边框才不会被 pixmap 盖住
+        b.setAcceptedMouseButtons(Qt.NoButton)   # 纯装饰，不拦截鼠标
+        self.scene.addItem(b)
+        items.append(b)
+        self._page_pix_items[pno] = items
+        self._page_render_sig[pno] = sig
+        self._anno_items_map[pno] = self._make_page_anno_items(pno)
+
+    def _make_page_anno_items(self, pno):
+        """生成某页全部批注图元并加入场景（坐标系含该页页顶偏移）。"""
+        out = []
+        ox, oy = self._page_origin(pno)
+        for i, a in enumerate(self.annos.get(pno, [])):
+            if not a:
+                continue
+            for it in self.anno_items(a, ox=ox, oy=oy):
+                it.setData(0, i)  # 图元 ↔ 批注列表索引 关联
+                self.scene.addItem(it)
+                out.append(it)
+        return out
+
+    def _on_view_scrolled(self):
+        """滚动条变化：把"跟随滚动"的工作全部推迟到事件循环执行。
+        绝不能在 valueChanged 回调里同步做任何事——此时 Qt 正在滚动/绘制中
+        遍历内部状态，重入会导致偶发访问违例（表现为退出时随机崩溃）。
+        0ms 单次定时器同时把连续多帧滚动合并成一次处理。"""
+        if self._sync_scroll or self._rendering or not self.doc or not self._page_tops:
+            return
+        self._win_timer.start()
+
+    def _apply_scroll_state(self):
+        """定时器回调：更新当前页并刷新窗口化渲染（滚动已稳定）。"""
+        if not self.doc or not self._page_tops:
+            return
+        self._render_window()
+        self._sync_page_from_scroll()
+        self._ensure_page_visible_x()   # 竖滚进入更窄的页时，页可能整页在视口外
+
+    def _sync_page_from_scroll(self):
+        """按滚动位置更新"当前页"（页码框/标签/进度/批注列表加粗）。"""
+        sb = self.view.verticalScrollBar()
+        pno = self._page_at_scroll(sb.value())
+        if pno == self.page_no:
+            return
+        self.page_no = pno
+        self._loading = True
+        self.page_spin.setValue(pno + 1)
+        self._loading = False
+        self.page_label.setText(f" {pno + 1}/{self.doc.page_count} ")
+        self._progress_timer.start(500)
+        if hasattr(self, "toc_tree"):
+            self.toc_tree.viewport().update()
+        self._maybe_refresh_anno_list()
+
+    def load_page(self, scroll_bottom=False, keep_scroll=False, land=None):
+        self.commit_text_editor()  # 翻页/缩放前提交内联文字（防图元悬挂到错误页）
+        if not self.doc:
+            return
+        dpr = self.view.devicePixelRatioF()
+
+        self._rebuild_doc_geometry()   # 整篇文档场景几何（页顶 y、总高）
+        ph = self._page_sizes[self.page_no][1]
+        top = self._page_tops[self.page_no]
 
         self._loading = True
         self.page_spin.setValue(self.page_no + 1)
@@ -4721,86 +6203,54 @@ class MainWindow(QMainWindow):
         self.page_label.setText(f" {self.page_no + 1}/{self.doc.page_count} ")
         self.zoom_label.setText(f"  {int(self.user_zoom * 100)}%  ")
 
-        # 保留滚动值（keep_scroll=True 时不重置，sceneRect 更新由 Qt 自动钳制）
-        vsb = self.view.verticalScrollBar()
-
-        self.scene.clear()
-        self.pix_item = self.scene.addPixmap(self.pixmap)
-        self._neighbor_items = []  # 邻页预览图元，rebuild_items 时保留
-        # 布局必须用逻辑尺寸（物理÷dpr）：带 DPR 的 pixmap 在场景中按逻辑大小
-        # 绘制；若用物理像素布局，高DPI屏上场景比可见内容宽(高)出 dpr 倍，
-        # 收起左面板视口变宽后页面就贴左不居中
-        d = dpr if dpr > 0 else 1.0
-        pw = self.pixmap.width() / d
-        ph = self.pixmap.height() / d
-        GAP = 16  # 页与页之间的间隔（浅灰底自然形成分隔，无需额外装饰）
-        # ---- 相邻页预览（连续滚动视觉：同时看到上一页/下一页部分内容） ----
-        self._prev_h = 0
-        self._next_y = ph + GAP
-        # 记录每页在场景中的矩形，供跨页文字选择换算坐标（阅读顺序：上页→当前→下页）
-        self._scene_page_rects = {}
-        # 页面细边框：每页四周一圈极细灰线，像"一张纸"贴在浅灰底上
-        def add_page_border(y0):
-            it = QGraphicsRectItem(QRectF(-0.5, y0 - 0.5, pw + 1, ph + 1))
-            it.setBrush(QBrush(Qt.NoBrush))
-            it.setPen(QPen(QColor("#c0c0c0"), 1))
-            it.setZValue(1)    # 压在页面之上，边框才不会被 pixmap 盖住
-            it.setAcceptedMouseButtons(Qt.NoButton)   # 纯装饰，不拦截鼠标
-            self.scene.addItem(it)
-            self._neighbor_items.append(it)
-        if self.doc.page_count > 1:
-            if self.page_no > 0:  # 上一页预览（显示在当前页上方）
-                pp = self.doc[self.page_no - 1]
-                prev_pix = pp.get_pixmap(matrix=pymupdf.Matrix(rz, rz), alpha=False)
-                pimg = QImage(prev_pix.samples, prev_pix.width, prev_pix.height,
-                              prev_pix.width * 3, QImage.Format_RGB888).copy()
-                ppm = QPixmap.fromImage(pimg)
-                ppm.setDevicePixelRatio(dpr)
-                pitem = self.scene.addPixmap(ppm)
-                pitem.setPos(0, -(ph + GAP))
-                pitem.setZValue(0)
-                self._neighbor_items.append(pitem)
-                self._prev_h = ph + GAP
-                self._scene_page_rects[self.page_no - 1] = pitem.sceneBoundingRect()
-                add_page_border(-(ph + GAP))
-            if self.page_no + 1 < self.doc.page_count:  # 下一页预览（当前页下方）
-                np_ = self.doc[self.page_no + 1]
-                npix = np_.get_pixmap(matrix=pymupdf.Matrix(rz, rz), alpha=False)
-                nimg = QImage(npix.samples, npix.width, npix.height,
-                              npix.width * 3, QImage.Format_RGB888).copy()
-                npm = QPixmap.fromImage(nimg)
-                npm.setDevicePixelRatio(dpr)
-                nitem = self.scene.addPixmap(npm)
-                nitem.setPos(0, self._next_y)
-                nitem.setZValue(0)
-                self._neighbor_items.append(nitem)
-                self._scene_page_rects[self.page_no + 1] = nitem.sceneBoundingRect()
-                add_page_border(self._next_y)
-        add_page_border(0)   # 当前页边框
-        self._scene_page_rects[self.page_no] = QRectF(0, 0, pw, ph)
-        self.scene.setSceneRect(0, -(self._prev_h), pw, ph + self._prev_h + GAP + ph)
-        self.view.setSceneRect(0, -(self._prev_h), pw, ph + self._prev_h + GAP + ph)
+        # 场景 = 整篇文档：滚动条贯穿全文（可一路拖到首页顶部/末页底部）
+        doc_rect = QRectF(0.0, 0.0, self._doc_scene_w, self._doc_scene_h)
+        # 先丢弃图元映射再 scene.clear()：setSceneRect 会同步触发滚动信号 →
+        # _render_window，若映射仍指向已被 clear 销毁的 C++ 图元，removeItem
+        # 会访问已释放对象（表现为退出时偶发崩溃）。绘制期间一并加锁重入。
+        self._page_pix_items = {}
+        self._anno_items_map = {}
+        self._page_render_sig = {}
+        self._rendering = True
+        try:
+            self.scene.clear()
+            self.scene.setSceneRect(doc_rect)
+            self.view.setSceneRect(doc_rect)
+        finally:
+            self._rendering = False
         self.preview_items = []
         self.sel_items = []      # scene.clear()已销毁旧图元，引用置空
-        self.rebuild_items()
-        self.render_selection()
-        # 滚动位置：下滑翻页落在新页页顶；上滑翻页落在新页页底；缩放时不动
-        # 必须同步设置：若用 QTimer 延迟，用户翻页后立刻拖选时定时器才触发，
-        # 会把视图突然挪走导致选区错位（表现为"刚切到这页选不中、过一会才行"）
+        # 先按目标位置定滚动条，再渲染视口附近的页（窗口化）
+        vh = self.view.viewport().height()
         if land is not None:
-            # 无缝翻页落点：邻页预览坐标→当前页坐标，并钳制在本页范围内
-            # （不落进邻页预览区，否则会"重看刚离开的页"）
-            vsb.setValue(max(0, min(land, ph - self.view.viewport().height())))
+            # 无缝翻页落点：页内偏移（相对页顶），钳制在本页范围内
+            target = top + max(0.0, min(land, ph - vh))
         elif scroll_bottom:
-            # 落在当前页页底（场景底部是下一页预览，不能用 maximum，否则重看刚离开的页）
-            vsb.setValue(max(vsb.minimum(), ph - self.view.viewport().height()))
+            target = top + max(0.0, ph - vh)
         elif not keep_scroll:
-            # 落在当前页页顶 y=0（场景顶部 -(prev_h) 是上一页预览，会"重复上一页"）
-            vsb.setValue(0)
+            target = top
+        else:
+            target = None
+        if target is not None:
+            self._set_scroll(target)
+        self._ensure_page_visible_x()   # 横向残留曾导致切页后画面空白
+        self._render_window()
+        self._sync_page_from_scroll()
+        self.render_selection()
         self.render_page_hits()
         # 目录树里"当前页"书签颜色随翻页更新
         if hasattr(self, "toc_tree"):
             self.toc_tree.viewport().update()
+        self._progress_timer.start(500)   # 记录阅读进度（防抖）
+        self._maybe_refresh_anno_list()   # 更新批注列表中"当前页"加粗标记
+
+    def _save_progress(self):
+        """把当前文档的页码/缩放写入进度文件。"""
+        if self.doc is not None and self.pdf_path:
+            try:
+                progress_set(self.pdf_path, self.page_no, self._zoom_factor)
+            except Exception:
+                pass
 
     # ---------------- 批注项生成 ----------------
     def _mkpen(self, hexc, w):
@@ -4810,35 +6260,40 @@ class MainWindow(QMainWindow):
         p.setJoinStyle(Qt.RoundJoin)
         return p
 
-    def anno_items(self, a, z=None):
-        """把一条批注(存PDF坐标)转成场景图元列表。"""
+    def anno_items(self, a, z=None, ox=0.0, oy=0.0):
+        """把一条批注(存PDF坐标)转成场景图元列表。
+        ox/oy = 该批注所在页的页顶/页左场景偏移（整篇文档坐标系）。"""
         z = z or self.zoom
         hexc, w = a["color"], max(1.0, a["wpt"] * z)
         t = a["type"]
         items = []
+
+        def P(x, y):
+            return QPointF(ox + x * z, oy + y * z)
+
+        def R(x0, y0, x1, y1):
+            x0, x1 = min(x0, x1), max(x0, x1)
+            y0, y1 = min(y0, y1), max(y0, y1)
+            return QRectF(ox + x0 * z, oy + y0 * z, (x1 - x0) * z, (y1 - y0) * z)
+
         if t == "rect":
-            r = QRectF(QPointF(*a["p1"]), QPointF(*a["p2"])).normalized()
-            r = QRectF(r.left() * z, r.top() * z, r.width() * z, r.height() * z)
-            it = QGraphicsRectItem(r)
+            it = QGraphicsRectItem(R(*a["p1"], *a["p2"]))
             it.setPen(self._mkpen(hexc, a["wpt"] * z))
             items.append(it)
         elif t == "oval":
-            r = QRectF(QPointF(*a["p1"]), QPointF(*a["p2"])).normalized()
-            r = QRectF(r.left() * z, r.top() * z, r.width() * z, r.height() * z)
-            it = QGraphicsEllipseItem(r)
+            it = QGraphicsEllipseItem(R(*a["p1"], *a["p2"]))
             it.setPen(self._mkpen(hexc, a["wpt"] * z))
             items.append(it)
         elif t == "line":
-            it = QGraphicsLineItem(a["p1"][0] * z, a["p1"][1] * z,
-                                   a["p2"][0] * z, a["p2"][1] * z)
+            p1, p2 = P(*a["p1"]), P(*a["p2"])
+            it = QGraphicsLineItem(p1.x(), p1.y(), p2.x(), p2.y())
             it.setPen(self._mkpen(hexc, a["wpt"] * z))
             items.append(it)
         elif t == "arrow":
-            items.extend(self.arrow_items(
-                QPointF(a["p1"][0] * z, a["p1"][1] * z),
-                QPointF(a["p2"][0] * z, a["p2"][1] * z), hexc, a["wpt"] * z))
+            items.extend(self.arrow_items(P(*a["p1"]), P(*a["p2"]),
+                                          hexc, a["wpt"] * z))
         elif t in ("pen", "highlight"):
-            pts = [QPointF(x * z, y * z) for x, y in a["pts"]]
+            pts = [P(x, y) for x, y in a["pts"]]
             if len(pts) >= 2:
                 path = QPainterPath(pts[0])
                 for p in pts[1:]:
@@ -4853,7 +6308,7 @@ class MainWindow(QMainWindow):
                 items.append(it)
         elif t == "texthl":
             x0, y0, x1, y1 = a["rect"]
-            it = QGraphicsRectItem(QRectF(x0 * z, y0 * z, (x1 - x0) * z, (y1 - y0) * z))
+            it = QGraphicsRectItem(R(x0, y0, x1, y1))
             it.setPen(QPen(Qt.NoPen))
             c = QColor(hexc)
             c.setAlpha(100)
@@ -4863,7 +6318,7 @@ class MainWindow(QMainWindow):
             it = QGraphicsTextItem(a["text"])
             it.setDefaultTextColor(QColor(hexc))
             it.setFont(QFont("Microsoft YaHei", max(6, int(a["fs"] * z))))
-            it.setPos(a["p"][0] * z, a["p"][1] * z)
+            it.setPos(ox + a["p"][0] * z, oy + a["p"][1] * z)
             it.setData(1, "text")  # 标记为文字批注（供缩放柄识别）
             items.append(it)
         for it in items:
@@ -4884,22 +6339,44 @@ class MainWindow(QMainWindow):
         return [line, head]
 
     def rebuild_items(self):
-        keep = {self.pix_item, *getattr(self, "_neighbor_items", [])}
-        for it in self.scene.items():
-            if it not in keep:
-                self.scene.removeItem(it)
-        for i, a in enumerate(self.annos.get(self.page_no, [])):
-            for it in self.anno_items(a):
-                it.setData(0, i)  # 图元 ↔ 批注列表索引 关联
-                self.scene.addItem(it)
+        """重建批注图元：已渲染的页全部重画（整篇文档坐标系）。"""
+        for pno in list(self._anno_items_map):
+            for it in self._anno_items_map.pop(pno):
+                try:
+                    if it.scene() is not None:
+                        self.scene.removeItem(it)
+                except RuntimeError:
+                    pass
+        for pno in list(self._page_pix_items):
+            self._anno_items_map[pno] = self._make_page_anno_items(pno)
 
-    def _add_anno_to_scene(self, a):
-        """追加一条批注并登记索引关联。"""
-        lst = self.annos.setdefault(self.page_no, [])
+    def _refresh_page_annos(self, pno):
+        """某页批注改动后：只重建该页的批注图元。"""
+        for it in self._anno_items_map.pop(pno, []):
+            try:
+                if it.scene() is not None:
+                    self.scene.removeItem(it)
+            except RuntimeError:
+                pass
+        if pno in self._page_pix_items:
+            self._anno_items_map[pno] = self._make_page_anno_items(pno)
+
+    def _add_anno_to_scene(self, a, record=True, pno=None):
+        """追加一条批注并登记索引关联。record=False 时不记录撤销（供批量操作）。"""
+        if pno is None:
+            pno = self.page_no
+        before = self._snapshot_page(pno) if record else None
+        lst = self.annos.setdefault(pno, [])
         lst.append(a)
-        for it in self.anno_items(a):
-            it.setData(0, len(lst) - 1)
-            self.scene.addItem(it)
+        ox, oy = self._page_origin(pno)
+        if pno in self._page_pix_items:
+            items = self._anno_items_map.setdefault(pno, [])
+            for it in self.anno_items(a, ox=ox, oy=oy):
+                it.setData(0, len(lst) - 1)
+                self.scene.addItem(it)
+                items.append(it)
+        if record:
+            self._push_undo(pno, before)
 
     def clear_preview(self):
         for it in self.preview_items:
@@ -4916,8 +6393,10 @@ class MainWindow(QMainWindow):
         # 注意: PySide6 的 mapToScene 只接受 QPoint（不接受 QPointF）
         return self.view.mapToScene(e.position().toPoint())
 
-    def pdf_pos(self, sp):
-        return sp.x() / self.zoom, sp.y() / self.zoom
+    def pdf_pos(self, sp, pno=None):
+        """场景坐标 → 指定页的 PDF 坐标（减去该页页顶/页左偏移）。"""
+        ox, oy = self._page_origin(self.page_no if pno is None else pno)
+        return (sp.x() - ox) / self.zoom, (sp.y() - oy) / self.zoom
 
     def on_press(self, e):
         if not self.doc or self.tool in ("view", "selanno"):
@@ -4925,6 +6404,8 @@ class MainWindow(QMainWindow):
         if e.button() != Qt.LeftButton:
             return False
         sp = self.scene_pos(e)
+        # 连续滚动下，落笔处所在页即本次绘制/编辑的目标页（可能≠当前页）
+        self._draw_page = self._page_at_scroll(sp.y())
         if self.tool == "text":
             # 画布内联输入（类似图片编辑器）：已有编辑器则先提交旧的
             self.commit_text_editor()
@@ -4956,7 +6437,12 @@ class MainWindow(QMainWindow):
     def on_move(self, e):
         if not self.doc or self.tool == "view" or not self.drawing:
             return False
-        sp = self.scene_pos(e)
+        return self.on_move_to(self.scene_pos(e))
+
+    def on_move_to(self, sp):
+        """按场景坐标 sp 更新拖拽预览（供鼠标移动与边缘自动滚动共用）。"""
+        if not self.doc or self.tool == "view" or not self.drawing:
+            return False
         t = self.tool
         w = self.wpt * self.zoom
         self.clear_preview()
@@ -5008,9 +6494,8 @@ class MainWindow(QMainWindow):
         t = self.tool
         rgb = hex_rgb(self.color_hex)
         self.clear_preview()
-        p1 = self.pdf_pos(self.start)
-        p2 = self.pdf_pos(sp)
-
+        # 批注统一落到"起笔所在页"，避免跨页拖动时坐标错页
+        dpage = self._draw_page
         if t == "selecttext":
             hits = self.words_in_scene(QRectF(self.start, sp).normalized())
             if not hits:
@@ -5039,6 +6524,8 @@ class MainWindow(QMainWindow):
                     f"已选中并复制 {len(self.sel_text)} 字符（按H可转为高亮批注）: {preview}")
             return True
 
+        p1 = self.pdf_pos(self.start, dpage)
+        p2 = self.pdf_pos(sp, dpage)
         if t in ("rect", "oval", "line", "arrow"):
             if (abs(sp.x() - self.start.x()) < 2 and
                     abs(sp.y() - self.start.y()) < 2):
@@ -5052,24 +6539,26 @@ class MainWindow(QMainWindow):
                 self._pen_item = None
             if len(self.free_pts) < 2:
                 return True  # 太短不保存
-            pts = [self.pdf_pos(p) for p in self.free_pts]
+            pts = [self.pdf_pos(p, dpage) for p in self.free_pts]
             a = {"type": t, "pts": pts, "color": self.color_hex, "rgb": rgb,
                  "wpt": HL_W if t == "highlight" else self.wpt}
         elif t == "texthl":
             a_list = self.make_text_highlights(
-                QRectF(QPointF(*p1), QPointF(*p2)).normalized())
+                QRectF(QPointF(*p1), QPointF(*p2)).normalized(), pno=dpage)
             if not a_list:
                 self.statusBar().showMessage(
                     "该区域未命中文字（文字高亮需拖过PDF真实文字）")
                 return True
+            before = self._snapshot_page(dpage)
             for a in a_list:
-                self._add_anno_to_scene(a)
+                self._add_anno_to_scene(a, record=False, pno=dpage)
+            self._push_undo(dpage, before)
             self.statusBar().showMessage(f"已高亮 {len(a_list)} 行文字")
             return True
         else:
             return True
 
-        self._add_anno_to_scene(a)
+        self._add_anno_to_scene(a, pno=dpage)
         return True
 
     # ---------------- 文字选择/复制 ----------------
@@ -5081,6 +6570,12 @@ class MainWindow(QMainWindow):
         if ws is None:
             ws = self.doc[pno].get_text("words")
             self._words_cache[pno] = ws
+            # 只保留最近几页：本缓存按访问顺序淘汰，避免翻遍全书后
+            # 把每页词表都留在内存里（大文档下这是几百 MB 级的泄漏）。
+            while len(self._words_cache) > WORDS_CACHE_MAX:
+                self._words_cache.popitem(last=False)
+        else:
+            self._words_cache.move_to_end(pno)
         return ws
 
     def _hit_words(self, pno, sel_rect):
@@ -5219,6 +6714,7 @@ class MainWindow(QMainWindow):
         for pno, w in self.sel_hits:
             by_page.setdefault(pno, {}).setdefault((w[5], w[6]), []).append(w[:4])
         n = 0
+        snaps = {pno: self._snapshot_page(pno) for pno in by_page}
         for pno, groups in by_page.items():
             lst = self.annos.setdefault(pno, [])
             for rects in groups.values():
@@ -5230,7 +6726,8 @@ class MainWindow(QMainWindow):
                             "color": self.color_hex,
                             "rgb": hex_rgb(self.color_hex), "wpt": 1})
                 n += 1
-        self.rebuild_items()
+            self._push_undo(pno, snaps[pno])
+            self._refresh_page_annos(pno)
         self.clear_selection()
         self.statusBar().showMessage(
             f"已将选中文字转为高亮批注（{n} 行，颜色：当前所选颜色）")
@@ -5289,6 +6786,7 @@ class MainWindow(QMainWindow):
             if os.path.isdir(old_img_dir):
                 os.makedirs(new_img_dir, exist_ok=True)
                 cnt = 0
+                failed = 0
                 for name in os.listdir(old_img_dir):
                     s = os.path.join(old_img_dir, name)
                     d = os.path.join(new_img_dir, name)
@@ -5296,9 +6794,14 @@ class MainWindow(QMainWindow):
                         try:
                             shutil.copy2(s, d); cnt += 1
                         except Exception:
-                            pass
+                            failed += 1
                 if cnt:
                     moved.append(f"{cnt} 张图片")
+                if failed:
+                    QMessageBox.warning(
+                        self, "部分图片未迁移",
+                        f"有 {failed} 张图片复制失败（源文件可能被占用或磁盘已满），"
+                        "旧位置文件仍保留，可手动复制。")
         if moved:
             QMessageBox.information(self, "迁移完成",
                 "已把 " + "、".join(moved) + " 复制到新位置。\n"
@@ -5320,17 +6823,19 @@ class MainWindow(QMainWindow):
                 "请先用'选择批注'工具点选/框选要删除的批注（可多选）")
             return
         n = 0
+        before = self._snapshot_page(self.page_no)
         for i in sorted(idxs, reverse=True):
             if isinstance(i, int) and 0 <= i < len(lst) and lst[i] is not None:
                 lst[i] = None
                 n += 1
         self.annos[self.page_no] = [a for a in lst if a]
-        self.rebuild_items()
+        self._refresh_page_annos(self.page_no)
+        self._push_undo(self.page_no, before)
         self.statusBar().showMessage(f"已删除 {n} 条批注")
 
-    def make_text_highlights(self, sel_rect):
+    def make_text_highlights(self, sel_rect, pno=None):
         """查找与选区相交的文字词，按行合并成高亮批注。sel_rect为PDF坐标。"""
-        words = self.get_words()
+        words = self.get_words(pno)
         groups = {}
         for w in words:
             x0, y0, x1, y1, word, blk, line, wno = w[:8]
@@ -5359,22 +6864,90 @@ class MainWindow(QMainWindow):
     def on_text_editor_closed(self):
         self._text_editor = None
 
+    def _snapshot_page(self, pno):
+        """深拷贝某页的批注列表（供撤销记录）。"""
+        return copy.deepcopy(self.annos.get(pno, []))
+
+    def _maybe_refresh_anno_list(self):
+        """批注列表可见时才重建（避免无谓开销）。"""
+        try:
+            if self.left_stack.isVisible() and self.left_stack.currentIndex() == 3:
+                self.refresh_anno_list()
+        except Exception:
+            pass
+
+    def _push_undo(self, pno, before):
+        """记录一次批注改动：before=改动前该页批注列表。清空重做栈。"""
+        if before is None:
+            return
+        after = self._snapshot_page(pno)
+        if before == after:
+            return
+        self._undo_stack.append({"page": pno, "before": before, "after": after})
+        if len(self._undo_stack) > 100:
+            self._undo_stack.pop(0)
+        self._redo_stack = []
+        self._maybe_refresh_anno_list()
+
+    def _apply_page_snapshot(self, pno, snap):
+        """把某页批注恢复为快照内容。若该页为空则移除键。"""
+        if snap:
+            self.annos[pno] = copy.deepcopy(snap)
+        else:
+            self.annos.pop(pno, None)
+
     def undo(self):
+        """跨页撤销：回退最近一次批注改动（可跨页，自动跳到该页）。"""
         if self._view_mode == "md":
             return
-        lst = self.annos.get(self.page_no)
-        if not lst:
-            self.statusBar().showMessage("本页没有可撤销的批注")
+        if not self._undo_stack:
+            self.statusBar().showMessage("没有可撤销的批注改动")
             return
-        lst.pop()
-        self.rebuild_items()
+        rec = self._undo_stack.pop()
+        pno = rec["page"]
+        self._apply_page_snapshot(pno, rec["before"])
+        self._redo_stack.append(rec)
+        self._show_page_after_history(pno)
+        self.statusBar().showMessage(f"已撤销第 {pno + 1} 页的批注改动")
+
+    def redo(self):
+        """重做：恢复最近一次被撤销的批注改动。"""
+        if self._view_mode == "md":
+            return
+        if not self._redo_stack:
+            self.statusBar().showMessage("没有可重做的批注改动")
+            return
+        rec = self._redo_stack.pop()
+        pno = rec["page"]
+        self._apply_page_snapshot(pno, rec["after"])
+        self._undo_stack.append(rec)
+        self._show_page_after_history(pno)
+        self.statusBar().showMessage(f"已重做第 {pno + 1} 页的批注改动")
+
+    def _show_page_after_history(self, pno):
+        """撤销/重做后：滚到受影响页并重绘该页批注。"""
+        if self.doc is None:
+            return
+        pno = max(0, min(pno, self.doc.page_count - 1))
+        pno = max(0, min(pno, len(self._page_tops) - 1))
+        self.page_no = pno
+        self._loading = True
+        self.page_spin.setValue(pno + 1)
+        self._loading = False
+        self.page_label.setText(f" {pno + 1}/{self.doc.page_count} ")
+        self._set_scroll(self._page_tops[pno])   # 滚到该页页顶
+        self._render_window()
+        self._refresh_page_annos(pno)
+        self._maybe_refresh_anno_list()
 
     def clear_page(self):
         if self._view_mode == "md":
             return
         if self.annos.get(self.page_no):
+            before = self._snapshot_page(self.page_no)
             self.annos[self.page_no] = []
-            self.rebuild_items()
+            self._refresh_page_annos(self.page_no)
+            self._push_undo(self.page_no, before)
 
     def _state_sig(self):
         """当前编辑状态签名（批注/书签/删页），用于判断是否有未保存改动。
@@ -5418,8 +6991,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         """退出前逐个处理所有打开 PDF 的未保存改动；再收尾线程/文档。"""
-        # 0) 保存当前笔记
+        # 0) 保存当前笔记 + 当前阅读进度
         self.note_panel.save_current()
+        self._progress_timer.stop()
+        self._save_progress()
         # 1) 先把当前文档状态写回其会话
         self._store_current_session()
         # 2) 记录当前会话，便于用户取消时恢复显示
@@ -5477,10 +7052,29 @@ class MainWindow(QMainWindow):
         super().closeEvent(e)
 
 
+def pdfs_from_argv(argv):
+    """从命令行参数里挑出 PDF 路径（右键"打开方式"/拖到图标时会传入）。
+    忽略选项参数（以 - 开头）与非 .pdf 的参数。"""
+    out = []
+    for a in argv:
+        if not a or a.startswith("-"):
+            continue
+        if a.lower().endswith(".pdf"):
+            out.append(a)
+    return out
+
+
 def main():
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()
+    # 支持"右键→打开方式 / 拖到图标 / 关联打开"传入的 PDF 路径：
+    # Windows 会把被打开的文件绝对路径作为命令行参数传进来
+    argv_pdfs = pdfs_from_argv(sys.argv[1:])
+    if argv_pdfs:
+        target = next((p for p in argv_pdfs if os.path.isfile(p)), argv_pdfs[0])
+        # 延迟到事件循环启动后加载：此时窗口尺寸/视口已就绪
+        QTimer.singleShot(0, lambda: win.load_pdf_path(target))
     sys.exit(app.exec())
 
 
