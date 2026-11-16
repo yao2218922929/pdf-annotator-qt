@@ -1,0 +1,11 @@
+# 运行依赖（Python 3.10+）
+PySide6>=6.5
+PyMuPDF>=1.24
+
+# Markdown 阅读面板
+markdown>=3.5
+
+# OCR 文字层：为扫描版 PDF 添加可选中/可搜索的文字层
+# 不用 OCR 功能可以不装，程序其余功能正常
+rapidocr>=3.0
+onnxruntime>=1.17
