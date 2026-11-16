@@ -29,6 +29,13 @@ dist_onedir/
 *.zip
 *.spec
 
+# PyInstaller 文件夹版产物（含大量 dll/pyd）
+PDF批注工具Qt版-文件夹版/
+
+# 个人笔记与临时日志
+原理图阅读笔记.md
+_*.txt
+
 # 本地临时脚本
 _align.py
 _z_*.py
